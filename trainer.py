@@ -126,6 +126,8 @@ class OnlineTrainer:
         # resets so SliceSampler never samples across episode boundaries.
         _next_episode_id = stepper.env_num
         train_metrics = {}
+        episode_scores: list[float] = []
+        episode_lengths: list[float] = []
         stepper.reset()
         agent_state = agent.get_initial_state(stepper.env_num)
         # (B, A)
@@ -141,7 +143,7 @@ class OnlineTrainer:
                 agent_state = agent.get_initial_state(stepper.env_num)
                 act = agent_state["prev_action"].clone()
                 video_cache = []
-            # Save metrics
+            # Collect episode metrics (flushed at training log cadence below)
             if done.any():
                 for i, d in enumerate(done):
                     if d and lengths[i] > 0:
@@ -149,9 +151,8 @@ class OnlineTrainer:
                             video = torch.stack(video_cache, axis=0)
                             self.logger.video("train_video", tools.to_np(video[None]))
                             video_cache = []
-                        self.logger.scalar("episode/score", returns[i])
-                        self.logger.scalar("episode/length", lengths[i])
-                        self.logger.write(self._step + i)  # to show all values on tensorboard
+                        episode_scores.append(returns[i].item())
+                        episode_lengths.append(lengths[i].item())
                         returns[i] = lengths[i] = 0
             self._step += stepper.count_active_steps(done) * self._action_repeat
             lengths += ~done
@@ -197,6 +198,11 @@ class OnlineTrainer:
                 update_count += update_num
                 # Log training metrics
                 if self._should_log(self._step):
+                    if episode_scores:
+                        self.logger.scalar("episode/score", sum(episode_scores) / len(episode_scores))
+                        self.logger.scalar("episode/length", sum(episode_lengths) / len(episode_lengths))
+                        episode_scores.clear()
+                        episode_lengths.clear()
                     for name, value in train_metrics.items():
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                         self.logger.scalar(f"train/{name}", value)

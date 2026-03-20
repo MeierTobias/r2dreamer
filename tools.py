@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import pathlib
 import random
 import re
 import time
@@ -588,6 +589,36 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+def load_init_checkpoint(agent, checkpoint_path, device):
+    """Load only model weights from a checkpoint (no optimizer/step/scheduler state).
+
+    Used to initialize a fresh training run from pretrained weights.
+    """
+    checkpoint_path = pathlib.Path(checkpoint_path).expanduser()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"init_checkpoint not found: {checkpoint_path}")
+
+    print(f"Initializing weights from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["agent_state_dict"]
+    missing, unexpected = agent.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  WARNING: {len(missing)} missing keys (not in checkpoint):")
+        for k in missing[:10]:
+            print(f"    - {k}")
+        if len(missing) > 10:
+            print(f"    ... and {len(missing) - 10} more")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} unexpected keys (not in model):")
+        for k in unexpected[:10]:
+            print(f"    - {k}")
+        if len(unexpected) > 10:
+            print(f"    ... and {len(unexpected) - 10} more")
+    if not missing and not unexpected:
+        print("  All weights loaded successfully (exact match).")
+    del checkpoint
 
 
 def build_module_tree(module: nn.Module, module_name: str = "") -> dict:

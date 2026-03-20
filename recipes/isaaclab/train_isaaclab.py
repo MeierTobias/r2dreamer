@@ -188,6 +188,9 @@ def run(config, build_env, simulation_app, vision=False):
         act_space,
     ).to(config.device)
 
+    # Validate init_checkpoint path early.
+    _init_ckpt = config.init_checkpoint
+
     # Resume from checkpoint if one exists in the logdir.
     _resume_step = 0
     checkpoint_path = logdir / "latest.pt"
@@ -206,6 +209,8 @@ def run(config, build_env, simulation_app, vision=False):
         if "ema_updates" in checkpoint and hasattr(agent, "_ema_updates"):
             agent._ema_updates = checkpoint["ema_updates"]
         print(f"  Restored agent weights, optimizer states, step={_resume_step}")
+    elif _init_ckpt is not None:
+        tools.load_init_checkpoint(agent, _init_ckpt, config.device)
 
     def _save_checkpoint(step):
         items_to_save = {

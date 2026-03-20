@@ -5,10 +5,11 @@ defaults:
   - override hydra/job_logging: disabled
   - _self_
 
-logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
+logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S} # if logdir is set to a non empty directory the training will continue from the latest checkpoint in that directory
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
+init_checkpoint: null  # Path to checkpoint for weight-only init (pretrain -> finetune)
 
 hydra:
   run:

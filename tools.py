@@ -591,10 +591,24 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         obj_now.load_state_dict(state_dict)
 
 
-def load_init_checkpoint(agent, checkpoint_path, device):
+_WORLD_MODEL_PREFIXES = (
+    "encoder.", "rssm.", "reward.", "cont.", "decoder.",
+    "prj.", "_prototypes", "obs_proj.", "feat_proj.",
+    "_ema_encoder.", "_ema_obs_proj.",
+)
+
+
+def load_init_checkpoint(agent, checkpoint_path, device, world_model_only=False):
     """Load only model weights from a checkpoint (no optimizer/step/scheduler state).
 
     Used to initialize a fresh training run from pretrained weights.
+
+    Parameters
+    ----------
+    world_model_only : bool
+        If True, load only world model components (encoder, rssm, reward,
+        cont, decoder, etc.) and skip actor/critic weights so they start
+        from random initialization.
     """
     checkpoint_path = pathlib.Path(checkpoint_path).expanduser()
     if not checkpoint_path.exists():
@@ -603,6 +617,13 @@ def load_init_checkpoint(agent, checkpoint_path, device):
     print(f"Initializing weights from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["agent_state_dict"]
+    if world_model_only:
+        full_count = len(state_dict)
+        state_dict = {
+            k: v for k, v in state_dict.items()
+            if k.startswith(_WORLD_MODEL_PREFIXES)
+        }
+        print(f"  World-model-only: kept {len(state_dict)}/{full_count} checkpoint keys")
     missing, unexpected = agent.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"  WARNING: {len(missing)} missing keys (not in checkpoint):")

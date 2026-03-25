@@ -10,6 +10,7 @@ seed: 0
 deterministic_run: False
 device: 'cuda:0'
 init_checkpoint: null  # Path to checkpoint for weight-only init (pretrain -> finetune)
+load_world_model_only: false  # When true + init_checkpoint set: load only world model weights, skip actor/critic
 
 hydra:
   run:

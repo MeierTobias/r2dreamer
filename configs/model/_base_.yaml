@@ -6,6 +6,7 @@ lamb: 0.95
 compile: True
 log_grads: False
 device: ${device}
+micro_batch_size: ${batch_size}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 
 lr: 4e-5

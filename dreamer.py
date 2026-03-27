@@ -21,6 +21,7 @@ class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
         self.device = torch.device(config.device)
+        self.micro_batch_size = int(config.micro_batch_size)
         self.act_entropy = float(config.act_entropy)
         self.kl_free = float(config.kl_free)
         self.imag_horizon = int(config.imag_horizon)
@@ -315,7 +316,13 @@ class Dreamer(nn.Module):
         return torch.cat([truth, model, error], 2)
 
     def update(self, replay_buffer):
-        """Sample a batch from replay and perform one optimization step."""
+        """Sample a batch from replay and perform one optimization step.
+
+        When ``micro_batch_size < batch_size``, the sampled batch is split into
+        micro-batches and gradients are accumulated before the optimizer step.
+        This produces mathematically identical gradients while reducing peak GPU
+        memory proportionally.
+        """
         if self._compile and not self._compiled:
             print("Compiling update function with torch.compile...")
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
@@ -329,9 +336,28 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
-        metrics = {}
-        with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
+
+        B = p_data.shape[0]
+        mbs = self.micro_batch_size
+        num_acc = B // mbs
+        loss_scale = 1.0 / num_acc
+
+        # Collect posteriors from each micro-batch for buffer update
+        all_stoch = []
+        all_deter = []
+        mets = {}
+
+        for i in range(num_acc):
+            s = i * mbs
+            e = s + mbs
+            micro_data = p_data[s:e]
+            micro_initial = (initial[0][s:e], initial[1][s:e])
+            with autocast(device_type=self.device.type, dtype=torch.float16):
+                (stoch, deter), mets = self._cal_grad(micro_data, micro_initial, loss_scale)
+            all_stoch.append(stoch)
+            all_deter.append(deter)
+
+        # Optimizer step (once, after all micro-batches)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
@@ -355,13 +381,15 @@ class Dreamer(nn.Module):
             params_rms = tools.compute_rms(self._named_params.values())
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
-        metrics.update(mets)
-        # update latent vectors in replay buffer
-        replay_buffer.update(index, stoch.detach(), deter.detach())
-        return metrics
 
-    def _cal_grad(self, data, initial):
-        """Compute gradients for one batch.
+        # Update latent vectors in replay buffer with concatenated posteriors
+        all_stoch = torch.cat(all_stoch, dim=0)
+        all_deter = torch.cat(all_deter, dim=0)
+        replay_buffer.update(index, all_stoch.detach(), all_deter.detach())
+        return mets
+
+    def _cal_grad(self, data, initial, loss_scale=1.0):
+        """Compute gradients for one (micro-)batch.
 
         Notes
         -----
@@ -537,7 +565,7 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
+        self._scaler.scale(total_loss * loss_scale).backward()
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})

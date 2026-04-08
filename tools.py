@@ -396,10 +396,11 @@ class JSONLBackend(LoggerBackend):
 
 
 class TensorBoardBackend(LoggerBackend):
-    def __init__(self, logdir):
+    def __init__(self, logdir, video_fps=16):
         from torch.utils.tensorboard import SummaryWriter
 
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+        self._video_fps = video_fps
 
     def log_scalar(self, name, value, step):
         tag = name if "/" in name else "scalars/" + name
@@ -414,7 +415,7 @@ class TensorBoardBackend(LoggerBackend):
             value = np.clip(255 * value, 0, 255).astype(np.uint8)
         B, T, H, W, C = value.shape
         value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-        self._writer.add_video(name, value, step, 16)
+        self._writer.add_video(name, value, step, self._video_fps)
 
     def log_histogram(self, name, value, step):
         self._writer.add_histogram(name, value, step)
@@ -450,10 +451,11 @@ class WandbBackend(LoggerBackend):
         for the full list.
     """
 
-    def __init__(self, wandb_cfg: dict):
+    def __init__(self, wandb_cfg: dict, video_fps=16):
         import wandb
 
         self._wandb = wandb
+        self._video_fps = video_fps
         if wandb.run is None:
             wandb.init(**wandb_cfg)
 
@@ -471,7 +473,7 @@ class WandbBackend(LoggerBackend):
         B, T, H, W, C = value.shape
         value = value.transpose(1, 4, 2, 0, 3).reshape((T, C, H, B * W))
         self._wandb.log(
-            {name: self._wandb.Video(value, fps=16, format="gif")},
+            {name: self._wandb.Video(value, fps=self._video_fps, format="gif")},
             step=step,
         )
 

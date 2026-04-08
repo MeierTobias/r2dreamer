@@ -231,6 +231,14 @@ class IsaacLabVecEnv:
         reward_out = torch.where(zero_reward, torch.zeros_like(reward_out), reward_out)
         data["reward"] = reward_out.unsqueeze(-1)
 
+        # Apply the same pending_first zeroing to opponent_reward if present.
+        # opponent_reward is already (B, 1) from the obs_dict loop above.
+        if "opponent_reward" in data:
+            opp_reward_out = data["opponent_reward"].float()
+            zero_mask = zero_reward.unsqueeze(-1) if opp_reward_out.ndim > 1 else zero_reward
+            opp_reward_out = torch.where(zero_mask, torch.zeros_like(opp_reward_out), opp_reward_out)
+            data["opponent_reward"] = opp_reward_out
+
         td = TensorDict(data, batch_size=(self._num_envs,), device=self._device)
 
         # ------------------------------------------------------------------

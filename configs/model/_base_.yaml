@@ -10,6 +10,7 @@ micro_batch_size: ${batch_size}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 opponent_separation: false
 imag_opponent: 'random'
+trajectory_mirroring: false
 
 lr: 4e-5
 agc: 0.3

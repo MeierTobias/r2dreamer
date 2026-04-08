@@ -403,10 +403,13 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
 
-        # Update latent vectors in replay buffer with concatenated posteriors
+        # Update latent vectors in replay buffer with concatenated posteriors.
+        # When trajectory mirroring is active the batch is doubled (original +
+        # mirrored), but only the original half has valid storage indices.
         all_stoch = torch.cat(all_stoch, dim=0)
         all_deter = torch.cat(all_deter, dim=0)
-        replay_buffer.update(index, all_stoch.detach(), all_deter.detach())
+        orig_B = getattr(replay_buffer, "_original_batch_size", all_stoch.shape[0])
+        replay_buffer.update(index, all_stoch[:orig_B].detach(), all_deter[:orig_B].detach())
         return mets
 
     def _cal_grad(self, data, initial, loss_scale=1.0):

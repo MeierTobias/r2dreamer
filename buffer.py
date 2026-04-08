@@ -12,6 +12,8 @@ class Buffer:
         self.storage_device = torch.device(config.storage_device)
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
+        self.mirror = bool(getattr(config, "mirror", False))
+        self._original_batch_size = None
         self.num_eps = 0
         if sampler is None:
             sampler = SliceSampler(
@@ -54,7 +56,64 @@ class Buffer:
         if "opponent_action" in sample_td.keys():
             data.set_("opponent_action", sample_td["opponent_action"][:, :-1])
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
+
+        self._original_batch_size = data.shape[0]
+        if self.mirror and "opponent_reward" in data.keys():
+            data, initial = self._mirror_trajectories(data, initial)
+
         return data, index, initial
+
+    def _mirror_trajectories(self, data, initial):
+        """Swap player/opponent perspectives to create mirrored copies.
+
+        Doubles the batch: ``[original_0..B-1, mirrored_0..B-1]``.
+        Mirrored trajectories get ``is_first[:, 0] = True`` and zero RSSM
+        initial states so the RSSM re-initialises from its learned prior.
+        """
+        from tensordict import TensorDict
+
+        mirror = data.clone()
+
+        # Swap state observations
+        mirror.set_("policy", data["opponent"].clone())
+        mirror.set_("opponent", data["policy"].clone())
+
+        # Swap images
+        if "image" in data.keys() and "opponent_image" in data.keys():
+            mirror.set_("image", data["opponent_image"].clone())
+            mirror.set_("opponent_image", data["image"].clone())
+
+        # Swap actions
+        if "opponent_action" in data.keys():
+            mirror.set_("action", data["opponent_action"].clone())
+            mirror.set_("opponent_action", data["action"].clone())
+
+        # Swap rewards
+        mirror.set_("reward", data["opponent_reward"].clone())
+        mirror.set_("opponent_reward", data["reward"].clone())
+
+        # Force RSSM re-initialisation for mirrored trajectories.
+        # NOTE: This forces the RSSM to start from its learned prior for
+        # mirrored sequences. The first few timesteps may have lower-quality
+        # latent representations compared to original trajectories (which
+        # have warm-started posteriors from buffer.update()). If this hurts
+        # training quality, revisit: options include storing opponent RSSM
+        # states in the buffer, or re-encoding from opponent observations.
+        mirror["is_first"] = mirror["is_first"].clone()
+        mirror["is_first"][:, 0] = True
+
+        # Concatenate original + mirrored
+        combined = torch.cat([data, mirror], dim=0)
+
+        # Zero initial RSSM states for mirrored half (the RSSM observe()
+        # will re-initialise from its learned prior due to is_first=True)
+        stoch_orig, deter_orig = initial
+        combined_initial = (
+            torch.cat([stoch_orig, torch.zeros_like(stoch_orig)], dim=0),
+            torch.cat([deter_orig, torch.zeros_like(deter_orig)], dim=0),
+        )
+
+        return combined, combined_initial
 
     def update(self, index, stoch, deter):
         # Flatten the data

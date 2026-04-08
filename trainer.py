@@ -43,6 +43,14 @@ class OnlineTrainer:
         else:
             self._step = 0
 
+    def on_episode_end(self, episode_id: int, env_index: int) -> None:
+        """Called when an episode ends.  Override to tag episodes in the buffer."""
+        pass
+
+    def on_log(self) -> None:
+        """Called at each logging step.  Override to add custom metrics."""
+        pass
+
     def eval(self, agent, train_step):
         """Run evaluation episodes.
 
@@ -135,6 +143,8 @@ class OnlineTrainer:
         while self._step < self.steps:
             # Evaluation
             if self._should_eval(self._step) and self.eval_episode_num > 0:
+                if hasattr(self.replay_buffer, "flush_all_episodes"):
+                    self.replay_buffer.flush_all_episodes()
                 self.eval(agent, self._step)
                 stepper.reset()
                 done = torch.ones(stepper.env_num, dtype=torch.bool, device=agent.device)
@@ -183,8 +193,10 @@ class OnlineTrainer:
             # is_first=True), which is where SliceSampler should see the
             # trajectory boundary.
             for _i in done.nonzero(as_tuple=False).squeeze(-1).tolist():
+                finished_ep_id = episode_ids[_i].item()
                 episode_ids[_i] = _next_episode_id
                 _next_episode_id += 1
+                self.on_episode_end(finished_ep_id, _i)
 
             # Update models after enough data has accumulated
             if self.replay_buffer.count() // stepper.env_num > self.batch_length + 1:
@@ -215,6 +227,7 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
+                    self.on_log()
                     self.logger.write(self._step, fps=True)
             # Periodic checkpoint saving
             if self._save_fn is not None and self._should_save is not None and self._should_save(self._step):

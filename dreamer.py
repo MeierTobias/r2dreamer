@@ -2,19 +2,18 @@ import copy
 import math
 from collections import OrderedDict
 
-import torch
-import torch.nn.functional as F
-from tensordict import TensorDict
-from torch import nn
-from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import LambdaLR
-
 import networks
 import rssm
 import tools
+import torch
+import torch.nn.functional as F
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
+from tensordict import TensorDict
 from tools import to_f32
+from torch import nn
+from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import LambdaLR
 
 
 class Dreamer(nn.Module):
@@ -31,6 +30,11 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
 
+        # Opponent separation: feed opponent actions to the world model
+        self.opponent_separation = bool(getattr(config, "opponent_separation", False))
+        self._imag_opponent = str(getattr(config, "imag_opponent", "random"))
+        wm_act_dim = self.act_dim * 2 if self.opponent_separation else self.act_dim
+
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
@@ -38,7 +42,7 @@ class Dreamer(nn.Module):
         self.rssm = rssm.RSSM(
             config.rssm,
             self.embed_size,
-            self.act_dim,
+            wm_act_dim,
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -262,16 +266,26 @@ class Dreamer(nn.Module):
         action_dist = self._frozen_actor(feat)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
+        # Build the RSSM prev_action: action dim * 2 when opponent_separation is on.
+        if self.opponent_separation:
+            opp_act = obs.get("opponent_action", torch.zeros_like(action))
+            wm_action = torch.cat([action, opp_act], dim=-1)
+        else:
+            wm_action = action
         return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
+            {"stoch": stoch, "deter": deter, "prev_action": wm_action},
             batch_size=state.batch_size,
         )
 
     @torch.no_grad()
     def get_initial_state(self, B):
         stoch, deter = self.rssm.initial(B)
+        wm_act_dim = self.act_dim * 2 if self.opponent_separation else self.act_dim
+        prev_action = torch.zeros(B, wm_act_dim, dtype=torch.float32, device=self.device)
         action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
-        return TensorDict({"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,))
+        return TensorDict(
+            {"stoch": stoch, "deter": deter, "prev_action": prev_action, "action": action}, batch_size=(B,)
+        )
 
     @torch.no_grad()
     def video_pred(self, data, initial):
@@ -288,12 +302,18 @@ class Dreamer(nn.Module):
         # (B, T, E)
         embed = self.encoder(data)
 
-        T = data["action"].shape[1]
+        # Build world-model action for video prediction.
+        if self.opponent_separation and "opponent_action" in data.keys():
+            wm_action = torch.cat([data["action"], data["opponent_action"]], dim=-1)
+        else:
+            wm_action = data["action"]
+
+        T = wm_action.shape[1]
         context_len = min(5, T)
 
         post_stoch, post_deter, _ = self.rssm.observe(
             embed[:B, :context_len],
-            data["action"][:B, :context_len],
+            wm_action[:B, :context_len],
             tuple(val[:B] for val in initial),
             data["is_first"][:B, :context_len],
         )
@@ -301,10 +321,11 @@ class Dreamer(nn.Module):
 
         if T > context_len:
             init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
+            open_action = wm_action[:B, context_len:]
             prior_stoch, prior_deter = self.rssm.imagine_with_action(
                 init_stoch,
                 init_deter,
-                data["action"][:B, context_len:],
+                open_action,
             )
             openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
             model = torch.cat([recon[:, :context_len], openl], 1)
@@ -407,8 +428,13 @@ class Dreamer(nn.Module):
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
         embed = self.encoder(data)
+        # Build world-model action: 4D (player + opponent) when opponent_separation is on.
+        if self.opponent_separation:
+            wm_action = torch.cat([data["action"], data["opponent_action"]], dim=-1)  # (B, T, 4)
+        else:
+            wm_action = data["action"]  # (B, T, 2)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
+        post_stoch, post_deter, post_logit = self.rssm.observe(embed, wm_action, initial, data["is_first"])
         # (B, T, S, K)
         _, prior_logit = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
@@ -582,15 +608,41 @@ class Dreamer(nn.Module):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
             # (B, A)
-            action = self._frozen_actor(feat).rsample()
-            # Append feat and its corresponding sampled action at the same time step.
+            player_action = self._frozen_actor(feat).rsample()
             feats.append(feat)
-            actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            actions.append(player_action)
+            # Build world-model action: concatenate opponent action when separation is on.
+            if self.opponent_separation:
+                opp_action = self._get_imag_opponent_action(feat, player_action)
+                wm_action = torch.cat([player_action, opp_action], dim=-1)  # (B, 4)
+            else:
+                wm_action = player_action  # (B, 2)
+            stoch, deter = self._frozen_rssm.img_step(stoch, deter, wm_action)
 
         # Stack along sequence dim T_imag.
-        # (B, T_imag, F), (B, T_imag, A)
+        # (B, T_imag, F), (B, T_imag, A) — actions are 2D (player only)
         return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
+
+    @torch.no_grad()
+    def _get_imag_opponent_action(self, feat, player_action):
+        """Generate opponent actions during imagination rollouts.
+
+        Scale considerations:
+        - The actor uses bounded_normal: Normal(tanh(mean), std) with std in [0.1, 1.0]
+        - During training, the RSSM sees opponent actions from the same bounded_normal
+          distribution (same actor architecture for the self-play opponent).
+        - The RSSM Deter.forward() normalizes elementwise:
+          action / clip(|action|, min=1), so values > 1 are dampened.
+        - Uniform(-1, 1) covers the same support as tanh(mean) which lives in (-1, 1).
+        - frozen_actor produces the exact same distribution the world model was trained on.
+        """
+        B = feat.shape[0]
+        if self._imag_opponent == "zero":
+            return torch.zeros(B, self.act_dim, device=feat.device)
+        elif self._imag_opponent == "frozen_actor":
+            return self._frozen_actor(feat).rsample()
+        else:  # "random"
+            return 2 * torch.rand(B, self.act_dim, device=feat.device) - 1
 
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):

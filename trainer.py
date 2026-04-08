@@ -71,7 +71,7 @@ class OnlineTrainer:
         cache = []
         agent_state = agent.get_initial_state(stepper.env_num)
         # (B, A)
-        act = agent_state["prev_action"].clone()
+        act = agent_state["action"].clone()
         while not once_done.all():
             steps += ~done * ~once_done
             # Step environments via the stepper (handles device transfers).
@@ -139,7 +139,7 @@ class OnlineTrainer:
         stepper.reset()
         agent_state = agent.get_initial_state(stepper.env_num)
         # (B, A)
-        act = agent_state["prev_action"].clone()
+        act = agent_state["action"].clone()
         while self._step < self.steps:
             # Evaluation
             if self._should_eval(self._step) and self.eval_episode_num > 0:
@@ -151,7 +151,7 @@ class OnlineTrainer:
                 returns.zero_()
                 lengths.zero_()
                 agent_state = agent.get_initial_state(stepper.env_num)
-                act = agent_state["prev_action"].clone()
+                act = agent_state["action"].clone()
                 video_cache = []
             # Collect episode metrics (flushed at training log cadence below)
             if done.any():
@@ -179,6 +179,8 @@ class OnlineTrainer:
             # We keep the observation and the action that produced it together.
             # Mask actions after an episode has ended.
             trans["action"] = act * ~done.unsqueeze(-1)
+            if "opponent_action" in trans:
+                trans["opponent_action"] = trans["opponent_action"] * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"]
             trans["deter"] = agent_state["deter"]
             trans["episode"] = episode_ids  # Don't lift dim

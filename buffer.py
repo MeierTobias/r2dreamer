@@ -51,6 +51,8 @@ class Buffer:
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
         data = sample_td[:, 1:]
         data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
+        if "opponent_action" in sample_td.keys():
+            data.set_("opponent_action", sample_td["opponent_action"][:, :-1])
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
         return data, index, initial
 

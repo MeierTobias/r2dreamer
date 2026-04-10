@@ -234,23 +234,34 @@ class LoggerBackend(ABC):
 
 
 class FPSTracker:
-    """Tracks frames-per-second between consecutive ``compute`` calls."""
+    """Tracks frames-per-second between consecutive ``compute`` calls.
 
-    def __init__(self):
+    The first few readings are suppressed by default (returns ``None``) to
+    exclude the unreliable measurements caused by pretrain and lazy CUDA graph
+    compilation.  Set *warmup* to ``False`` to disable this behaviour.
+    """
+
+    _WARMUP_CALLS = 3
+
+    def __init__(self, warmup=True):
         self._last_time = None
         self._last_step = None
+        self._warmup = self._WARMUP_CALLS if warmup else 0
 
     def compute(self, step):
-        """Return FPS since the last call."""
+        """Return FPS since the last call, or ``None`` during warmup."""
         now = time.time()
         if self._last_step is None:
             self._last_time = now
             self._last_step = step
-            return 0
+            return None
         steps = step - self._last_step
         duration = now - self._last_time
         self._last_time = now
         self._last_step = step
+        if self._warmup > 0:
+            self._warmup -= 1
+            return None
         return steps / duration if duration > 0 else 0
 
     def reset(self, step=0):

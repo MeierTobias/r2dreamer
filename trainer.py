@@ -1,6 +1,5 @@
-import torch
-
 import tools
+import torch
 
 
 class OnlineTrainer:
@@ -73,7 +72,9 @@ class OnlineTrainer:
         agent_state = agent.get_initial_state(stepper.env_num)
         # (B, A)
         act = agent_state["action"].clone()
+        _eval_iters = 0
         while not once_done.all():
+            _eval_iters += 1
             steps += ~done * ~once_done
             # Step environments via the stepper (handles device transfers).
             trans, done = stepper.step(act.detach(), done.detach())
@@ -113,7 +114,9 @@ class OnlineTrainer:
                     )
                 ),
             )
-        total_eval_steps = steps.sum().item()
+        # Use total env interactions (iters * envs) for FPS so that
+        # wall-clock time spent on envs that finished early is accounted for.
+        total_eval_steps = _eval_iters * stepper.env_num
         self.logger.write(train_step)
         agent.train()
         return total_eval_steps
@@ -151,7 +154,9 @@ class OnlineTrainer:
                 self._fps.reset()
                 _eval_steps = self.eval(agent, self._step)
                 if _eval_steps is not None:
-                    self.logger.scalar("fps/eval", self._fps.compute(_eval_steps * self._action_repeat))
+                    _eval_fps = self._fps.compute(_eval_steps * self._action_repeat)
+                    if _eval_fps is not None:
+                        self.logger.scalar("fps/eval", _eval_fps)
                 self._fps.reset(self._step)
                 stepper.reset()
                 done = torch.ones(stepper.env_num, dtype=torch.bool, device=agent.device)
@@ -236,7 +241,9 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
-                    self.logger.scalar("fps/train", self._fps.compute(self._step))
+                    _train_fps = self._fps.compute(self._step)
+                    if _train_fps is not None:
+                        self.logger.scalar("fps/train", _train_fps)
                     self.on_log()
                     self.logger.write(self._step)
             # Periodic checkpoint saving

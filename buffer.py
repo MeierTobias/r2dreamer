@@ -13,6 +13,7 @@ class Buffer:
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
         self.mirror = bool(getattr(config, "mirror", False))
+        self.mirror_opp_warm_start = bool(getattr(config, "mirror_opp_warm_start", False))
         self._original_batch_size = None
         self.num_eps = 0
         if sampler is None:
@@ -51,6 +52,9 @@ class Buffer:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
+        opp_initial = None
+        if "opp_stoch" in sample_td.keys():
+            opp_initial = (sample_td["opp_stoch"][:, 0], sample_td["opp_deter"][:, 0])
         data = sample_td[:, 1:]
         data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
         if "opponent_action" in sample_td.keys():
@@ -59,19 +63,25 @@ class Buffer:
 
         self._original_batch_size = data.shape[0]
         if self.mirror and "opponent_reward" in data.keys():
-            data, initial = self._mirror_trajectories(data, initial)
+            data, initial, opp_initial = self._mirror_trajectories(data, initial, opp_initial)
 
-        return data, index, initial
+        return data, index, initial, opp_initial
 
-    def _mirror_trajectories(self, data, initial):
+    def _mirror_trajectories(self, data, initial, opp_initial=None):
         """Swap player/opponent perspectives to create mirrored copies.
 
         Doubles the batch: ``[original_0..B-1, mirrored_0..B-1]``.
-        Mirrored trajectories get ``is_first[:, 0] = True`` and zero RSSM
-        initial states so the RSSM re-initialises from its learned prior.
-        """
-        from tensordict import TensorDict
 
+        When ``mirror_opp_warm_start`` is False (default), mirrored
+        trajectories get ``is_first[:, 0] = True`` and zero RSSM initial
+        states so the RSSM re-initialises from its learned prior.
+
+        When ``mirror_opp_warm_start`` is True **and** opponent RSSM states
+        are available, mirrored trajectories use the opponent's t=0 state as
+        the player initial (warm-start), the player's stored per-timestep
+        states as the opponent imagination states, and ``is_first[:, 0]`` is
+        NOT forced True so the warm initial survives the first ``obs_step``.
+        """
         mirror = data.clone()
 
         # Swap state observations
@@ -92,28 +102,66 @@ class Buffer:
         mirror.set_("reward", data["opponent_reward"].clone())
         mirror.set_("opponent_reward", data["reward"].clone())
 
-        # Force RSSM re-initialisation for mirrored trajectories.
-        # NOTE: This forces the RSSM to start from its learned prior for
-        # mirrored sequences. The first few timesteps may have lower-quality
-        # latent representations compared to original trajectories (which
-        # have warm-started posteriors from buffer.update()). If this hurts
-        # training quality, revisit: options include storing opponent RSSM
-        # states in the buffer, or re-encoding from opponent observations.
-        mirror["is_first"] = mirror["is_first"].clone()
-        mirror["is_first"][:, 0] = True
+        # --- Opponent RSSM states for imagination ---
+        has_opp = "opp_stoch" in data.keys() and opp_initial is not None
+        if has_opp and self.mirror_opp_warm_start:
+            # Mirrored "opponent" was the original player → use player's
+            # stored per-timestep states as the imagination opponent states.
+            mirror.set_("opp_stoch", data["stoch"].clone())
+            mirror.set_("opp_deter", data["deter"].clone())
+        elif has_opp:
+            # Zero opponent states for mirrored half (backward-compatible).
+            mirror.set_("opp_stoch", torch.zeros_like(data["opp_stoch"]))
+            mirror.set_("opp_deter", torch.zeros_like(data["opp_deter"]))
 
-        # Concatenate original + mirrored
+        # --- is_first handling ---
+        if has_opp and self.mirror_opp_warm_start:
+            # Keep original is_first — do NOT force True at t=0.
+            # The warm initial state (from opponent) must survive the first
+            # obs_step; obs_step zeros state when is_first=True.
+            pass
+        else:
+            # Current behaviour: force RSSM re-init for mirrored trajectories.
+            mirror["is_first"] = mirror["is_first"].clone()
+            mirror["is_first"][:, 0] = True
+
+        # --- Concatenate original + mirrored ---
         combined = torch.cat([data, mirror], dim=0)
 
-        # Zero initial RSSM states for mirrored half (the RSSM observe()
-        # will re-initialise from its learned prior due to is_first=True)
+        # --- Player initial ---
         stoch_orig, deter_orig = initial
-        combined_initial = (
-            torch.cat([stoch_orig, torch.zeros_like(stoch_orig)], dim=0),
-            torch.cat([deter_orig, torch.zeros_like(deter_orig)], dim=0),
-        )
+        if has_opp and self.mirror_opp_warm_start:
+            # Mirrored "player" was the original opponent → warm-start
+            # from the opponent's t=0 RSSM state.
+            opp_init_stoch, opp_init_deter = opp_initial
+            combined_initial = (
+                torch.cat([stoch_orig, opp_init_stoch], dim=0),
+                torch.cat([deter_orig, opp_init_deter], dim=0),
+            )
+        else:
+            combined_initial = (
+                torch.cat([stoch_orig, torch.zeros_like(stoch_orig)], dim=0),
+                torch.cat([deter_orig, torch.zeros_like(deter_orig)], dim=0),
+            )
 
-        return combined, combined_initial
+        # --- Opponent initial (for imagination warm-start) ---
+        if opp_initial is not None:
+            opp_s, opp_d = opp_initial
+            if self.mirror_opp_warm_start:
+                # Mirrored opponent initial = original player initial.
+                combined_opp_initial = (
+                    torch.cat([opp_s, stoch_orig], dim=0),
+                    torch.cat([opp_d, deter_orig], dim=0),
+                )
+            else:
+                combined_opp_initial = (
+                    torch.cat([opp_s, torch.zeros_like(opp_s)], dim=0),
+                    torch.cat([opp_d, torch.zeros_like(opp_d)], dim=0),
+                )
+        else:
+            combined_opp_initial = None
+
+        return combined, combined_initial, combined_opp_initial
 
     def update(self, index, stoch, deter):
         # Flatten the data

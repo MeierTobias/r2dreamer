@@ -236,7 +236,7 @@ class OnlineTrainer:
                     if self.video_pred_log:
                         _sample = self.replay_buffer.sample()
                         if _sample is not None:
-                            data, _, initial = _sample
+                            data, _, initial, _opp_initial = _sample
                             self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():

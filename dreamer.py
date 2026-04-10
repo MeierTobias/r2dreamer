@@ -33,6 +33,10 @@ class Dreamer(nn.Module):
         # Opponent separation: feed opponent actions to the world model
         self.opponent_separation = bool(getattr(config, "opponent_separation", False))
         self._imag_opponent = str(getattr(config, "imag_opponent", "random"))
+        # Opponent networks for "selfplay" imagination mode — set externally
+        # via set_imag_opponent_networks() after the self-play wrapper creates them.
+        self._imag_opp_rssm = None
+        self._imag_opp_actor = None
         wm_act_dim = self.act_dim * 2 if self.opponent_separation else self.act_dim
 
         # World model components
@@ -287,6 +291,16 @@ class Dreamer(nn.Module):
             {"stoch": stoch, "deter": deter, "prev_action": prev_action, "action": action}, batch_size=(B,)
         )
 
+    def set_imag_opponent_networks(self, opp_rssm, opp_actor):
+        """Set frozen opponent RSSM and actor for ``"selfplay"`` imagination.
+
+        These should be the same module instances owned by
+        :class:`DreamerSelfPlayWrapper`, so weight updates via
+        ``load_state_dict`` propagate automatically.
+        """
+        self._imag_opp_rssm = opp_rssm
+        self._imag_opp_actor = opp_actor
+
     @torch.no_grad()
     def video_pred(self, data, initial):
         torch.compiler.cudagraph_mark_step_begin()
@@ -351,7 +365,7 @@ class Dreamer(nn.Module):
         sample = replay_buffer.sample()
         if sample is None:
             return {}  # skip this update – trajectories too short
-        data, index, initial = sample
+        data, index, initial, opp_initial = sample
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
         self._update_slow_target()
@@ -373,8 +387,13 @@ class Dreamer(nn.Module):
             e = s + mbs
             micro_data = p_data[s:e]
             micro_initial = (initial[0][s:e], initial[1][s:e])
+            micro_opp_initial = None
+            if opp_initial is not None:
+                micro_opp_initial = (opp_initial[0][s:e], opp_initial[1][s:e])
             with autocast(device_type=self.device.type, dtype=torch.float16):
-                (stoch, deter), mets = self._cal_grad(micro_data, micro_initial, loss_scale)
+                (stoch, deter), mets = self._cal_grad(
+                    micro_data, micro_initial, loss_scale, opp_initial=micro_opp_initial
+                )
             all_stoch.append(stoch)
             all_deter.append(deter)
 
@@ -412,7 +431,7 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, all_stoch[:orig_B].detach(), all_deter[:orig_B].detach())
         return mets
 
-    def _cal_grad(self, data, initial, loss_scale=1.0):
+    def _cal_grad(self, data, initial, loss_scale=1.0, opp_initial=None):
         """Compute gradients for one (micro-)batch.
 
         Notes
@@ -511,8 +530,17 @@ class Dreamer(nn.Module):
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
+        # Opponent RSSM start for "selfplay" imagination mode.
+        opp_start = None
+        if self.opponent_separation and self._imag_opponent == "selfplay":
+            if "opp_stoch" in data:
+                # Per-timestep opponent states from buffer: (B, T, ...) → (B*T, ...)
+                opp_start = (
+                    data["opp_stoch"].reshape(-1, *data["opp_stoch"].shape[2:]).detach(),
+                    data["opp_deter"].reshape(-1, *data["opp_deter"].shape[2:]).detach(),
+                )
         # (B, T, ...) -> (B*T, ...)
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
+        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, opp_start=opp_start)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
         # (B*T, T_imag, 1)
@@ -601,12 +629,34 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon):
-        """Roll out the policy in latent space."""
+    def _imagine(self, start, imag_horizon, opp_start=None):
+        """Roll out the policy in latent space.
+
+        Parameters
+        ----------
+        start : tuple[Tensor, Tensor]
+            Player RSSM state ``(stoch, deter)`` with batch dim ``B``.
+        imag_horizon : int
+            Number of imagination steps.
+        opp_start : tuple[Tensor, Tensor] | None
+            Opponent RSSM state for ``"selfplay"`` imagination.  When
+            ``None`` the opponent RSSM is initialised from zeros.
+        """
         # (B, S, K), (B, D)
         feats = []
         actions = []
         stoch, deter = start
+        B = stoch.shape[0]
+
+        # Initialise opponent RSSM for selfplay imagination.
+        selfplay = self.opponent_separation and self._imag_opponent == "selfplay"
+        if selfplay:
+            if opp_start is not None:
+                opp_stoch, opp_deter = opp_start
+            else:
+                opp_stoch, opp_deter = self._imag_opp_rssm.initial(B)
+            opp_prev_action = torch.zeros(B, self._imag_opp_rssm._act_dim, device=stoch.device)
+
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
@@ -616,8 +666,22 @@ class Dreamer(nn.Module):
             actions.append(player_action)
             # Build world-model action: concatenate opponent action when separation is on.
             if self.opponent_separation:
-                opp_action = self._get_imag_opponent_action(feat, player_action)
-                wm_action = torch.cat([player_action, opp_action], dim=-1)  # (B, 4)
+                if selfplay:
+                    # Opponent acts from its own RSSM state.
+                    opp_feat = self._imag_opp_rssm.get_feat(opp_stoch, opp_deter)
+                    opp_action = self._imag_opp_actor(opp_feat).rsample()
+                    # Player world-model action: [player, opponent]
+                    wm_action = torch.cat([player_action, opp_action], dim=-1)  # (B, 4)
+                    # Opponent RSSM prev_action: [opponent, player] (reversed
+                    # perspective, matching DreamerSelfPlayWrapper.step()).
+                    opp_prev_action = torch.cat([opp_action, player_action], dim=-1)
+                    # Opponent prior transition (no observations in imagination).
+                    opp_stoch, opp_deter = self._imag_opp_rssm.img_step(
+                        opp_stoch, opp_deter, opp_prev_action
+                    )
+                else:
+                    opp_action = self._get_imag_opponent_action(feat, player_action)
+                    wm_action = torch.cat([player_action, opp_action], dim=-1)  # (B, 4)
             else:
                 wm_action = player_action  # (B, 2)
             stoch, deter = self._frozen_rssm.img_step(stoch, deter, wm_action)
@@ -630,20 +694,13 @@ class Dreamer(nn.Module):
     def _get_imag_opponent_action(self, feat, player_action):
         """Generate opponent actions during imagination rollouts.
 
-        Scale considerations:
-        - The actor uses bounded_normal: Normal(tanh(mean), std) with std in [0.1, 1.0]
-        - During training, the RSSM sees opponent actions from the same bounded_normal
-          distribution (same actor architecture for the self-play opponent).
-        - The RSSM Deter.forward() normalizes elementwise:
-          action / clip(|action|, min=1), so values > 1 are dampened.
-        - Uniform(-1, 1) covers the same support as tanh(mean) which lives in (-1, 1).
-        - frozen_actor produces the exact same distribution the world model was trained on.
+        Used for the ``"random"`` and ``"zero"`` modes.  The ``"selfplay"``
+        mode is handled directly in :meth:`_imagine` via a parallel opponent
+        RSSM and is not routed through this method.
         """
         B = feat.shape[0]
         if self._imag_opponent == "zero":
             return torch.zeros(B, self.act_dim, device=feat.device)
-        elif self._imag_opponent == "frozen_actor":
-            return self._frozen_actor(feat).rsample()
         else:  # "random"
             return 2 * torch.rand(B, self.act_dim, device=feat.device) - 1
 

@@ -25,6 +25,9 @@ buffer:
   max_size: 5e5
   device: ${device}
   storage_device: 'cuda:0'
+  prioritized:
+    enable: false
+    debug_metrics: false
 
 trainer:
   steps: ${env.steps}

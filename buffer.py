@@ -1,5 +1,5 @@
 import warnings
-from collections import defaultdict, deque
+from collections import defaultdict
 
 import torch
 from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
@@ -161,11 +161,8 @@ class PrioritizedBuffer(Buffer):
     def __init__(self, config):
         prioritized = config.prioritized
         self._baseline_priority = float(getattr(prioritized, "baseline_priority", 1.0))
-        self._buffer_capacity: int = int(config.max_size)
+        self._debug_metrics = bool(getattr(prioritized, "debug_metrics", False))
         self._episode_indices: dict[int, list] = defaultdict(list)
-        self._tag_counts: dict[str, int] = defaultdict(int)
-        self._current_tag_counts: dict[str, int] = defaultdict(int)
-        self._tag_episode_queue: deque[tuple[int, str]] = deque()
         self._episode_max_priority: dict[int, float] = {}
         self._episode_tags: dict[int, set[str]] = defaultdict(set)
         self._transitions_added: int = 0
@@ -187,17 +184,7 @@ class PrioritizedBuffer(Buffer):
         # Reset new transitions to baseline priority so they don't inherit the
         # inflated max_priority that results from tagging other episodes.
         self._buffer.update_priority(indices, torch.full((len(indices),), self._baseline_priority))
-        # Track total transitions for sliding-window eviction of current_tag_counts.
         self._transitions_added += len(data)
-        # Evict tagged episodes from the front of the queue once all their
-        # transitions are guaranteed overwritten (buffer has cycled past them).
-        while self._tag_episode_queue:
-            front_end, front_tag = self._tag_episode_queue[0]
-            if self._transitions_added - front_end >= self._buffer_capacity:
-                self._tag_episode_queue.popleft()
-                self._current_tag_counts[front_tag] = max(0, self._current_tag_counts[front_tag] - 1)
-            else:
-                break
         # Accumulate indices per episode for later priority update.
         episode_ids = data["episode"]
         for i in range(len(episode_ids)):
@@ -206,8 +193,8 @@ class PrioritizedBuffer(Buffer):
     def tag_episode(self, episode_id: int, priority: float, tag: str | None = None) -> None:
         """Boost sampling priority for every transition in *episode_id*.
 
-        The optional *tag* name is only used for internal statistics returned
-        by :meth:`get_tag_counts`.
+        The optional *tag* name is tracked in :attr:`_episode_tags` for
+        debug metrics (current tag counts, sampled fractions).
         """
         idx_list = self._episode_indices.get(episode_id, [])
         if not idx_list:
@@ -218,9 +205,7 @@ class PrioritizedBuffer(Buffer):
             self._buffer.update_priority(all_idx, torch.full((len(all_idx),), priority))
             self._episode_max_priority[episode_id] = priority
         if tag is not None:
-            self._tag_counts[tag] += 1
-            self._current_tag_counts[tag] += 1
-            self._tag_episode_queue.append((self._transitions_added, tag))
+            self._episode_tags[episode_id].add(tag)
 
     def flush_episode(self, episode_id: int) -> None:
         """Drop the index accumulator for an untagged (or fully tagged) episode."""
@@ -231,15 +216,47 @@ class PrioritizedBuffer(Buffer):
         """Clear all accumulators (e.g. before eval resets discard in-progress episodes)."""
         self._episode_indices.clear()
 
-    def get_tag_counts(self) -> dict[str, int]:
-        """Cumulative number of episodes tagged per tag name since training start."""
-        return dict(self._tag_counts)
+    def compute_current_tag_counts(self) -> tuple[dict[str, int], int]:
+        """Scan buffer storage for per-tag episode counts.
 
-    def get_current_tag_counts(self) -> dict[str, int]:
-        """Approximate number of tagged episodes currently in the buffer.
-
-        Uses a sliding deque: an episode is considered evicted once
-        ``_transitions_added - episode_end`` >= ``max_size``, i.e. the buffer
-        has cycled past all of its transitions.
+        Returns ``(tag_counts, unique_episode_count)``.
+        Also prunes ``_episode_tags`` of evicted episode IDs.
+        O(buffer_size) -- call infrequently (e.g. at eval time).
         """
-        return dict(self._current_tag_counts)
+        storage = self._buffer.storage  # LazyTensorStorage
+        if storage.shape is None:
+            return {}, 0
+        raw_td = storage._storage  # underlying TensorDict
+        episode_tensor = raw_td["episode"]
+        current_ids: set[int] = set(episode_tensor.reshape(-1).unique().tolist())
+        current_ids.discard(0)  # uninitialized slots before buffer fills
+
+        tag_counts: dict[str, int] = {}
+        for eid in current_ids:
+            for tag in self._episode_tags.get(eid, ()):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        # Prune evicted episodes to prevent unbounded growth
+        stale = set(self._episode_tags.keys()) - current_ids
+        for eid in stale:
+            del self._episode_tags[eid]
+
+        return tag_counts, len(current_ids)
+
+    def compute_sampled_tag_fractions(self) -> dict[str, float]:
+        """Fraction of last-sampled episodes that carry each tag."""
+        ep_ids = getattr(self, "last_sampled_episodes", None)
+        if not ep_ids:
+            return {}
+        unique_eps = set(ep_ids)
+        tag_hits: dict[str, int] = {}
+        for eid in unique_eps:
+            for tag in self._episode_tags.get(eid, ()):
+                tag_hits[tag] = tag_hits.get(tag, 0) + 1
+        n = max(len(unique_eps), 1)
+        return {tag: count / n for tag, count in tag_hits.items()}
+
+    def get_episode_tags(self, episode_id: int) -> set[str]:
+        """Return tag names associated with an episode."""
+        return self._episode_tags.get(episode_id, set())
+

@@ -233,10 +233,34 @@ class LoggerBackend(ABC):
         pass
 
 
+class FPSTracker:
+    """Tracks frames-per-second between consecutive ``compute`` calls."""
+
+    def __init__(self):
+        self._last_time = None
+        self._last_step = None
+
+    def compute(self, step):
+        """Return FPS since the last call."""
+        now = time.time()
+        if self._last_step is None:
+            self._last_time = now
+            self._last_step = step
+            return 0
+        steps = step - self._last_step
+        duration = now - self._last_time
+        self._last_time = now
+        self._last_step = step
+        return steps / duration if duration > 0 else 0
+
+    def reset(self, step=0):
+        """Reset the timer and step baseline."""
+        self._last_time = time.time()
+        self._last_step = step
+
+
 class Logger:
     def __init__(self, logdir, filename="metrics.jsonl", backends=None):
-        self._last_step = None
-        self._last_time = None
         self._scalars = {}
         self._images = {}
         self._videos = {}
@@ -263,10 +287,8 @@ class Logger:
     def histogram(self, name, value):
         self._histograms[name] = np.array(value)
 
-    def write(self, step, fps=False):
+    def write(self, step):
         scalars = list(self._scalars.items())
-        if fps:
-            scalars.append(("fps/fps", self._compute_fps(step)))
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         for name, value in scalars:
             for b in self._backends:
@@ -287,17 +309,6 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
-
-    def _compute_fps(self, step):
-        if self._last_step is None:
-            self._last_time = time.time()
-            self._last_step = step
-            return 0
-        steps = step - self._last_step
-        duration = time.time() - self._last_time
-        self._last_time += duration
-        self._last_step = step
-        return steps / duration
 
     def log_hydra_config(self, config, name="config", step=0, log_hparams=False, hparams_run_name="."):
         """

@@ -42,6 +42,7 @@ class OnlineTrainer:
                 self._should_save._last = self._step
         else:
             self._step = 0
+        self._fps = tools.FPSTracker()
 
     def on_episode_end(self, episode_id: int, env_index: int) -> None:
         """Called when an episode ends.  Override to tag episodes in the buffer."""
@@ -112,8 +113,10 @@ class OnlineTrainer:
                     )
                 ),
             )
+        total_eval_steps = steps.sum().item()
         self.logger.write(train_step)
         agent.train()
+        return total_eval_steps
 
     def begin(self, agent):
         """Main online training loop.
@@ -145,7 +148,11 @@ class OnlineTrainer:
             if self._should_eval(self._step) and self.eval_episode_num > 0:
                 if hasattr(self.replay_buffer, "flush_all_episodes"):
                     self.replay_buffer.flush_all_episodes()
-                self.eval(agent, self._step)
+                self._fps.reset()
+                _eval_steps = self.eval(agent, self._step)
+                if _eval_steps is not None:
+                    self.logger.scalar("fps/eval", self._fps.compute(_eval_steps * self._action_repeat))
+                self._fps.reset(self._step)
                 stepper.reset()
                 done = torch.ones(stepper.env_num, dtype=torch.bool, device=agent.device)
                 returns.zero_()
@@ -229,8 +236,9 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
+                    self.logger.scalar("fps/train", self._fps.compute(self._step))
                     self.on_log()
-                    self.logger.write(self._step, fps=True)
+                    self.logger.write(self._step)
             # Periodic checkpoint saving
             if self._save_fn is not None and self._should_save is not None and self._should_save(self._step):
                 self._save_fn(self._step)

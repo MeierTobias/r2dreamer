@@ -223,8 +223,36 @@ class PrioritizedBuffer(Buffer):
             strict_length=True,
             end_key=None,
             truncated_key=None,
+            cache_values=True,
         )
+        # Replace the upstream O(N) Python for-loop in _padded_indices with a
+        # vectorized broadcast+gather version (same semantics, constant time).
+        sampler._padded_indices = self._padded_indices_vectorized.__get__(sampler)
         super().__init__(config, sampler=sampler)
+
+    @staticmethod
+    def _padded_indices_vectorized(self, shapes, arange) -> torch.Tensor:
+        """Vectorized replacement for ``PrioritizedSliceSampler._padded_indices``.
+
+        Creates a left-padded 2-D index tensor identical to the upstream
+        version, but uses broadcast + gather instead of a Python for-loop.
+        """
+        max_group_len = int(shapes.max().item())
+        shapes_flat = shapes.view(-1)
+        pad_lengths = max_group_len - shapes_flat
+
+        group_ends = shapes_flat.cumsum(0)
+        group_starts = torch.empty_like(group_ends)
+        group_starts[0] = 0
+        group_starts[1:] = group_ends[:-1]
+
+        cols = torch.arange(max_group_len, device=arange.device, dtype=arange.dtype)
+        flat_idx = group_starts.unsqueeze(1) + cols.unsqueeze(0) - pad_lengths.unsqueeze(1)
+        flat_idx = flat_idx.clamp(0, max(len(arange) - 1, 0))
+
+        pad = arange[flat_idx]
+        pad[cols.unsqueeze(0) < pad_lengths.unsqueeze(1)] = -1
+        return pad
 
     def add_transition(self, data):
         # (B, ...) -> (B, 1, ...) as in Buffer; captures storage indices.
@@ -307,4 +335,3 @@ class PrioritizedBuffer(Buffer):
     def get_episode_tags(self, episode_id: int) -> set[str]:
         """Return tag names associated with an episode."""
         return self._episode_tags.get(episode_id, set())
-

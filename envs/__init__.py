@@ -9,7 +9,7 @@ def make_envs(config):
         # IsaacLab is already a GPU-resident vectorized env, it cannot be
         # wrapped in ParallelEnv.
         vec_env = config.isaac_vec_env
-        device = getattr(config, "device", "cuda:0")
+        device = getattr(config, "sim_device", None) or getattr(config, "device", "cuda:0")
         stepper = GpuEnvStepper(vec_env, device)
         return stepper, stepper, vec_env.observation_space, vec_env.action_space
 

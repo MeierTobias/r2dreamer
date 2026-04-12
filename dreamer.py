@@ -19,14 +19,17 @@ from torch.optim.lr_scheduler import LambdaLR
 class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
-        self.device = torch.device(config.device)
+        self.train_device = torch.device(config.train_device or config.device)
+        self.sim_device = torch.device(config.sim_device or config.device)
+        self.device = self.sim_device  # env-side tensors use sim_device
+        self.multi_gpu = (self.sim_device != self.train_device)
         self.micro_batch_size = int(config.micro_batch_size)
         self.act_entropy = float(config.act_entropy)
         self.kl_free = float(config.kl_free)
         self.imag_horizon = int(config.imag_horizon)
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
-        self.return_ema = networks.ReturnEMA(device=self.device)
+        self.return_ema = networks.ReturnEMA(device=self.train_device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
 
@@ -169,6 +172,12 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         self._compile = config.compile
         self._compiled = False
+        # Inference copies are created by to() which is called from the
+        # training script after construction.  Set aliases here so the
+        # attributes exist before to() is invoked.
+        self._inference_encoder = self._frozen_encoder
+        self._inference_rssm = self._frozen_rssm
+        self._inference_actor = self._frozen_actor
 
     def _update_slow_target(self):
         """Update slow-moving value target network."""
@@ -244,10 +253,69 @@ class Dreamer(nn.Module):
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
+    def _create_inference_copies(self):
+        """Create inference copies on sim_device for act() and video_pred().
+
+        Single GPU: reuse frozen copies (shared .data, zero overhead).
+        Multi-GPU: independent copies on sim_device.
+        """
+        if not self.multi_gpu:
+            self._inference_encoder = self._frozen_encoder
+            self._inference_rssm = self._frozen_rssm
+            self._inference_actor = self._frozen_actor
+            if hasattr(self, "decoder"):
+                self._inference_decoder = self.decoder
+            return
+        # Multi-GPU: independent copies on sim_device
+        enc = copy.deepcopy(self.encoder).to(self.sim_device).eval()
+        rssm = copy.deepcopy(self.rssm).to(self.sim_device).eval()
+        actor = copy.deepcopy(self.actor).to(self.sim_device).eval()
+        # Fix RSSM._device so initial() creates tensors on sim_device
+        rssm._device = self.sim_device
+        modules = [enc, rssm, actor]
+        # Decoder copy for video_pred on sim_device (~58 MB for 14.5M params)
+        if hasattr(self, "decoder"):
+            dec = copy.deepcopy(self.decoder).to(self.sim_device).eval()
+            self._inference_decoder_orig = dec
+            self._inference_decoder = dec
+            modules.append(dec)
+        for m in modules:
+            for p in m.parameters():
+                p.requires_grad_(False)
+        # Keep uncompiled originals for load_state_dict (compiled modules
+        # prefix keys with _orig_mod. which mismatches the source state_dict).
+        self._inference_encoder_orig = enc
+        self._inference_rssm_orig = rssm
+        self._inference_actor_orig = actor
+        if self._compile:
+            self._inference_encoder = torch.compile(enc, mode="reduce-overhead")
+            self._inference_rssm = torch.compile(rssm, mode="reduce-overhead")
+            self._inference_actor = torch.compile(actor, mode="reduce-overhead")
+        else:
+            self._inference_encoder = enc
+            self._inference_rssm = rssm
+            self._inference_actor = actor
+
+    def _sync_inference_copies(self):
+        """Sync inference copies from trainable modules after optimizer step.
+
+        Single GPU: frozen copies share .data, always up to date — no-op.
+        Multi-GPU: load_state_dict on the uncompiled originals; compiled
+        graphs share the same parameter tensors and pick up updates automatically.
+        """
+        if not self.multi_gpu:
+            return
+        self._inference_encoder_orig.load_state_dict(self.encoder.state_dict())
+        self._inference_rssm_orig.load_state_dict(self.rssm.state_dict())
+        self._inference_actor_orig.load_state_dict(self.actor.state_dict())
+        if hasattr(self, "_inference_decoder_orig"):
+            self._inference_decoder_orig.load_state_dict(self.decoder.state_dict())
+
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
         # Re-establish shared memory after moving the model to a new device
         self.clone_and_freeze()
+        self._create_inference_copies()
         return self
 
     @torch.no_grad()
@@ -257,17 +325,17 @@ class Dreamer(nn.Module):
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
         # (B, E)
-        embed = self._frozen_encoder(p_obs)
+        embed = self._inference_encoder(p_obs)
         prev_stoch, prev_deter, prev_action = (
             state["stoch"],
             state["deter"],
             state["prev_action"],
         )
         # (B, S, K), (B, D)
-        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
+        stoch, deter, _ = self._inference_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
         # (B, F)
-        feat = self._frozen_rssm.get_feat(stoch, deter)
-        action_dist = self._frozen_actor(feat)
+        feat = self._inference_rssm.get_feat(stoch, deter)
+        action_dist = self._inference_actor(feat)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
         # Build the RSSM prev_action: action dim * 2 when opponent_separation is on.
@@ -283,10 +351,10 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def get_initial_state(self, B):
-        stoch, deter = self.rssm.initial(B)
+        stoch, deter = self._inference_rssm.initial(B)
         wm_act_dim = self.act_dim * 2 if self.opponent_separation else self.act_dim
-        prev_action = torch.zeros(B, wm_act_dim, dtype=torch.float32, device=self.device)
-        action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
+        prev_action = torch.zeros(B, wm_act_dim, dtype=torch.float32, device=self.sim_device)
+        action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.sim_device)
         return TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": prev_action, "action": action}, batch_size=(B,)
         )
@@ -294,27 +362,72 @@ class Dreamer(nn.Module):
     def set_imag_opponent_networks(self, opp_rssm, opp_actor):
         """Set frozen opponent RSSM and actor for ``"selfplay"`` imagination.
 
-        These should be the same module instances owned by
-        :class:`DreamerSelfPlayWrapper`, so weight updates via
-        ``load_state_dict`` propagate automatically.
+        Single GPU: receives the same module instances owned by
+        :class:`DreamerSelfPlayWrapper`, so weight updates propagate
+        automatically via shared references.
+
+        Multi-GPU: the wrapper's copies live on ``sim_device`` but imagination
+        runs on ``train_device``, so we deep-copy to ``train_device``.  Call
+        :meth:`sync_imag_opponent_networks` after opponent weight updates.
         """
-        self._imag_opp_rssm = opp_rssm
-        self._imag_opp_actor = opp_actor
+        if self.multi_gpu:
+            self._imag_opp_rssm = copy.deepcopy(opp_rssm).to(self.train_device).eval()
+            self._imag_opp_rssm._device = self.train_device
+            self._imag_opp_actor = copy.deepcopy(opp_actor).to(self.train_device).eval()
+            for p in self._imag_opp_rssm.parameters():
+                p.requires_grad_(False)
+            for p in self._imag_opp_actor.parameters():
+                p.requires_grad_(False)
+            # Keep references to the sim-device originals for syncing.
+            self._imag_opp_rssm_src = opp_rssm
+            self._imag_opp_actor_src = opp_actor
+        else:
+            self._imag_opp_rssm = opp_rssm
+            self._imag_opp_actor = opp_actor
+
+    def sync_imag_opponent_networks(self):
+        """Sync imagination opponent copies from sim_device originals.
+
+        Only needed in multi-GPU mode; single-GPU shares references.
+        Call after :meth:`DreamerSelfPlayWrapper.maybe_update_opponent`.
+        """
+        if not self.multi_gpu:
+            return
+        if self._imag_opp_rssm is None:
+            return
+        self._imag_opp_rssm.load_state_dict(self._imag_opp_rssm_src.state_dict())
+        self._imag_opp_actor.load_state_dict(self._imag_opp_actor_src.state_dict())
 
     @torch.no_grad()
     def video_pred(self, data, initial):
         torch.compiler.cudagraph_mark_step_begin()
+        if self.multi_gpu:
+            # Run on sim_device using inference copies — avoids competing
+            # with CUDA graph private pools on train_device.
+            data = data.to(self.sim_device)
+            initial = tuple(v.to(self.sim_device) for v in initial)
+            p_data = self.preprocess(data)
+            return self._video_pred(
+                p_data, initial,
+                encoder=self._inference_encoder_orig,
+                rssm=self._inference_rssm_orig,
+                decoder=self._inference_decoder,
+            )
         p_data = self.preprocess(data)
         return self._video_pred(p_data, initial)
 
-    def _video_pred(self, data, initial):
+    def _video_pred(self, data, initial, encoder=None, rssm=None, decoder=None):
         """Video prediction utility."""
         if self.rep_loss != "dreamer":
             raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
 
+        encoder = encoder or self.encoder
+        rssm = rssm or self.rssm
+        decoder = decoder or self.decoder
+
         B = min(data["action"].shape[0], 6)
         # (B, T, E)
-        embed = self.encoder(data)
+        embed = encoder(data)
 
         # Build world-model action for video prediction.
         if self.opponent_separation and "opponent_action" in data.keys():
@@ -325,23 +438,23 @@ class Dreamer(nn.Module):
         T = wm_action.shape[1]
         context_len = min(5, T)
 
-        post_stoch, post_deter, _ = self.rssm.observe(
+        post_stoch, post_deter, _ = rssm.observe(
             embed[:B, :context_len],
             wm_action[:B, :context_len],
             tuple(val[:B] for val in initial),
             data["is_first"][:B, :context_len],
         )
-        recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
+        recon = decoder(post_stoch, post_deter)["image"].mode()[:B]
 
         if T > context_len:
             init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
             open_action = wm_action[:B, context_len:]
-            prior_stoch, prior_deter = self.rssm.imagine_with_action(
+            prior_stoch, prior_deter = rssm.imagine_with_action(
                 init_stoch,
                 init_deter,
                 open_action,
             )
-            openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
+            openl = decoder(prior_stoch, prior_deter)["image"].mode()
             model = torch.cat([recon[:, :context_len], openl], 1)
         else:
             model = recon[:, :context_len]
@@ -390,7 +503,7 @@ class Dreamer(nn.Module):
             micro_opp_initial = None
             if opp_initial is not None:
                 micro_opp_initial = (opp_initial[0][s:e], opp_initial[1][s:e])
-            with autocast(device_type=self.device.type, dtype=torch.float16):
+            with autocast(device_type=self.train_device.type, dtype=torch.float16):
                 (stoch, deter), mets = self._cal_grad(
                     micro_data, micro_initial, loss_scale, opp_initial=micro_opp_initial
                 )
@@ -429,6 +542,7 @@ class Dreamer(nn.Module):
         all_deter = torch.cat(all_deter, dim=0)
         orig_B = getattr(replay_buffer, "_original_batch_size", all_stoch.shape[0])
         replay_buffer.update(index, all_stoch[:orig_B].detach(), all_deter[:orig_B].detach())
+        self._sync_inference_copies()
         return mets
 
     def _cal_grad(self, data, initial, loss_scale=1.0, opp_initial=None):
@@ -494,7 +608,7 @@ class Dreamer(nn.Module):
             x2 = embed.reshape(B * T, -1).detach()  # this detach is important
             logits = torch.matmul(x1, x2.T)
             norm_logits = logits - torch.max(logits, 1)[0][:, None]
-            labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
+            labels = torch.arange(norm_logits.shape[0]).long().to(self.train_device)
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
         elif self.rep_loss == "dreamerpro":
             # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.

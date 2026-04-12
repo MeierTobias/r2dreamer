@@ -105,15 +105,12 @@ class OnlineTrainer:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
         if self.video_pred_log and cache is not None:
             initial = agent.get_initial_state(1)
-            self.logger.video(
-                "eval_open_loop",
-                tools.to_np(
-                    agent.video_pred(
-                        cache[:1],  # give only first batch
-                        (initial["stoch"], initial["deter"]),
-                    )
-                ),
+            vp = agent.video_pred(
+                cache[:1],  # give only first batch
+                (initial["stoch"], initial["deter"]),
             )
+            if vp is not None:
+                self.logger.video("eval_open_loop", tools.to_np(vp))
         # Use total env interactions (iters * envs) for FPS so that
         # wall-clock time spent on envs that finished early is accounted for.
         total_eval_steps = _eval_iters * stepper.env_num
@@ -237,7 +234,9 @@ class OnlineTrainer:
                         _sample = self.replay_buffer.sample()
                         if _sample is not None:
                             data, _, initial, _opp_initial = _sample
-                            self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                            vp = agent.video_pred(data, initial)
+                            if vp is not None:
+                                self.logger.video("open_loop", tools.to_np(vp))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))

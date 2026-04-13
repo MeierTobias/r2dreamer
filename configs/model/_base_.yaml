@@ -3,7 +3,9 @@ kl_free: 1.0
 imag_horizon: 15
 horizon: 333
 lamb: 0.95
-compile: True
+compile: True                  # enable torch.compile
+compile_mode: "reduce-overhead" # torch.compile mode for training: "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs" | "default"
+inference_compile_mode: null    # torch.compile mode for inference copies (act/video_pred). null = same as compile_mode, "none" = no compilation
 log_grads: False
 device: ${device}
 micro_batch_size: ${batch_size}

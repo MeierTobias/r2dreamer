@@ -215,6 +215,11 @@ class Dreamer(nn.Module):
         # Data-parallel replicas are created by to() after construction.
         self._replicas = []
         self._replica_scalers = []
+        # Deferred inference sync: training thread increments _weights_version
+        # after each optimizer step; main thread calls sync_inference_if_needed()
+        # to pull new weights before act().
+        self._weights_version = 0
+        self._inference_version = 0
 
     def _update_slow_target(self):
         """Update slow-moving value target network."""
@@ -349,6 +354,17 @@ class Dreamer(nn.Module):
         self._inference_actor_orig.load_state_dict(self.actor.state_dict())
         if hasattr(self, "_inference_decoder_orig"):
             self._inference_decoder_orig.load_state_dict(self.decoder.state_dict())
+
+    def sync_inference_if_needed(self):
+        """Sync inference copies only when training has produced new weights.
+
+        Called by the env collection thread before each act() call.  Avoids
+        redundant syncs when no optimizer step has occurred since the last sync.
+        Safe to call from a single thread (the env thread) without locking.
+        """
+        if self._inference_version < self._weights_version:
+            self._sync_inference_copies()
+            self._inference_version = self._weights_version
 
     def _create_training_replicas(self):
         """Create model replicas on secondary training GPUs for data-parallel training.
@@ -935,7 +951,10 @@ class Dreamer(nn.Module):
         # --- Sync weights ---
         if self.data_parallel:
             self._broadcast_params()       # primary -> replicas
-        self._sync_inference_copies()      # train -> sim GPU
+        # Signal that new weights are available for inference copies.
+        # The main thread calls sync_inference_if_needed() to pull them
+        # before the next act() call, avoiding blocking here.
+        self._weights_version += 1
 
         # Update latent vectors in replay buffer with concatenated posteriors.
         # When trajectory mirroring is active the batch is doubled (original +

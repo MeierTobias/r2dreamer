@@ -1,3 +1,4 @@
+import threading
 import warnings
 from collections import defaultdict
 
@@ -16,6 +17,7 @@ class Buffer:
         self.mirror_opp_warm_start = bool(getattr(config, "mirror_opp_warm_start", False))
         self._original_batch_size = None
         self.num_eps = 0
+        self._lock = threading.Lock()
         if sampler is None:
             sampler = SliceSampler(
                 num_slices=self.batch_size, end_key=None, traj_key="episode", truncated_key=None, strict_length=True
@@ -30,16 +32,18 @@ class Buffer:
     def add_transition(self, data):
         # This is batched data and lifted for storage.
         # (B, ...) -> (B, 1, ...)
-        self._buffer.extend(data.unsqueeze(1))
+        with self._lock:
+            self._buffer.extend(data.unsqueeze(1))
 
     def sample(self):
-        try:
-            sample_td, info = self._buffer.sample(return_info=True)
-        except RuntimeError as e:
-            if "sufficient length" in str(e):
-                warnings.warn(f"Replay buffer sample skipped: {e}")
-                return None
-            raise
+        with self._lock:
+            try:
+                sample_td, info = self._buffer.sample(return_info=True)
+            except RuntimeError as e:
+                if "sufficient length" in str(e):
+                    warnings.warn(f"Replay buffer sample skipped: {e}")
+                    return None
+                raise
         # The sampler returns a flattened batch of length B*(T+1).
         # (B*(T+1), ...) -> (B, T+1, ...)
         sample_td = sample_td.view(-1, self.batch_length + 1)
@@ -171,13 +175,15 @@ class Buffer:
         # (B, T, D) -> (B*T, D)
         deter = deter.reshape(-1, *deter.shape[2:])
         # In storage, the length is the first dimension, and the batch (number of environments) is the second dimension.
-        self._buffer[index[1], index[0]].set_("stoch", stoch)
-        self._buffer[index[1], index[0]].set_("deter", deter)
+        with self._lock:
+            self._buffer[index[1], index[0]].set_("stoch", stoch)
+            self._buffer[index[1], index[0]].set_("deter", deter)
 
     def count(self):
-        if self._buffer.storage.shape is None:
-            return 0
-        return self._buffer.storage.shape.numel()
+        with self._lock:
+            if self._buffer.storage.shape is None:
+                return 0
+            return self._buffer.storage.shape.numel()
 
 
 class PrioritizedBuffer(Buffer):
@@ -256,15 +262,16 @@ class PrioritizedBuffer(Buffer):
 
     def add_transition(self, data):
         # (B, ...) -> (B, 1, ...) as in Buffer; captures storage indices.
-        indices = self._buffer.extend(data.unsqueeze(1))  # shape (B, 2): [timestep, env]
-        # Reset new transitions to baseline priority so they don't inherit the
-        # inflated max_priority that results from tagging other episodes.
-        self._buffer.update_priority(indices, torch.full((len(indices),), self._baseline_priority))
-        self._transitions_added += len(data)
-        # Accumulate indices per episode for later priority update.
-        episode_ids = data["episode"]
-        for i in range(len(episode_ids)):
-            self._episode_indices[episode_ids[i].item()].append(indices[i : i + 1])
+        with self._lock:
+            indices = self._buffer.extend(data.unsqueeze(1))  # shape (B, 2): [timestep, env]
+            # Reset new transitions to baseline priority so they don't inherit the
+            # inflated max_priority that results from tagging other episodes.
+            self._buffer.update_priority(indices, torch.full((len(indices),), self._baseline_priority))
+            self._transitions_added += len(data)
+            # Accumulate indices per episode for later priority update.
+            episode_ids = data["episode"]
+            for i in range(len(episode_ids)):
+                self._episode_indices[episode_ids[i].item()].append(indices[i : i + 1])
 
     def tag_episode(self, episode_id: int, priority: float, tag: str | None = None) -> None:
         """Boost sampling priority for every transition in *episode_id*.
@@ -272,25 +279,28 @@ class PrioritizedBuffer(Buffer):
         The optional *tag* name is tracked in :attr:`_episode_tags` for
         debug metrics (current tag counts, sampled fractions).
         """
-        idx_list = self._episode_indices.get(episode_id, [])
-        if not idx_list:
-            return
-        cur_max = self._episode_max_priority.get(episode_id, 0.0)
-        if priority > cur_max:
-            all_idx = torch.cat(idx_list)  # (T, 2)
-            self._buffer.update_priority(all_idx, torch.full((len(all_idx),), priority))
-            self._episode_max_priority[episode_id] = priority
-        if tag is not None:
-            self._episode_tags[episode_id].add(tag)
+        with self._lock:
+            idx_list = self._episode_indices.get(episode_id, [])
+            if not idx_list:
+                return
+            cur_max = self._episode_max_priority.get(episode_id, 0.0)
+            if priority > cur_max:
+                all_idx = torch.cat(idx_list)  # (T, 2)
+                self._buffer.update_priority(all_idx, torch.full((len(all_idx),), priority))
+                self._episode_max_priority[episode_id] = priority
+            if tag is not None:
+                self._episode_tags[episode_id].add(tag)
 
     def flush_episode(self, episode_id: int) -> None:
         """Drop the index accumulator for an untagged (or fully tagged) episode."""
-        self._episode_indices.pop(episode_id, None)
-        self._episode_max_priority.pop(episode_id, None)
+        with self._lock:
+            self._episode_indices.pop(episode_id, None)
+            self._episode_max_priority.pop(episode_id, None)
 
     def flush_all_episodes(self) -> None:
         """Clear all accumulators (e.g. before eval resets discard in-progress episodes)."""
-        self._episode_indices.clear()
+        with self._lock:
+            self._episode_indices.clear()
 
     def compute_current_tag_counts(self) -> tuple[dict[str, int], int]:
         """Scan buffer storage for per-tag episode counts.
@@ -299,38 +309,40 @@ class PrioritizedBuffer(Buffer):
         Also prunes ``_episode_tags`` of evicted episode IDs.
         O(buffer_size) -- call infrequently (e.g. at eval time).
         """
-        storage = self._buffer.storage  # LazyTensorStorage
-        if storage.shape is None:
-            return {}, 0
-        raw_td = storage._storage  # underlying TensorDict
-        episode_tensor = raw_td["episode"]
-        current_ids: set[int] = set(episode_tensor.reshape(-1).unique().tolist())
-        current_ids.discard(0)  # uninitialized slots before buffer fills
+        with self._lock:
+            storage = self._buffer.storage  # LazyTensorStorage
+            if storage.shape is None:
+                return {}, 0
+            raw_td = storage._storage  # underlying TensorDict
+            episode_tensor = raw_td["episode"]
+            current_ids: set[int] = set(episode_tensor.reshape(-1).unique().tolist())
+            current_ids.discard(0)  # uninitialized slots before buffer fills
 
-        tag_counts: dict[str, int] = {}
-        for eid in current_ids:
-            for tag in self._episode_tags.get(eid, ()):
-                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            tag_counts: dict[str, int] = {}
+            for eid in current_ids:
+                for tag in self._episode_tags.get(eid, ()):
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-        # Prune evicted episodes to prevent unbounded growth
-        stale = set(self._episode_tags.keys()) - current_ids
-        for eid in stale:
-            del self._episode_tags[eid]
+            # Prune evicted episodes to prevent unbounded growth
+            stale = set(self._episode_tags.keys()) - current_ids
+            for eid in stale:
+                del self._episode_tags[eid]
 
-        return tag_counts, len(current_ids)
+            return tag_counts, len(current_ids)
 
     def compute_sampled_tag_fractions(self) -> dict[str, float]:
         """Fraction of last-sampled episodes that carry each tag."""
-        ep_ids = getattr(self, "last_sampled_episodes", None)
-        if not ep_ids:
-            return {}
-        unique_eps = set(ep_ids)
-        tag_hits: dict[str, int] = {}
-        for eid in unique_eps:
-            for tag in self._episode_tags.get(eid, ()):
-                tag_hits[tag] = tag_hits.get(tag, 0) + 1
-        n = max(len(unique_eps), 1)
-        return {tag: count / n for tag, count in tag_hits.items()}
+        with self._lock:
+            ep_ids = getattr(self, "last_sampled_episodes", None)
+            if not ep_ids:
+                return {}
+            unique_eps = set(ep_ids)
+            tag_hits: dict[str, int] = {}
+            for eid in unique_eps:
+                for tag in self._episode_tags.get(eid, ()):
+                    tag_hits[tag] = tag_hits.get(tag, 0) + 1
+            n = max(len(unique_eps), 1)
+            return {tag: count / n for tag, count in tag_hits.items()}
 
     def get_episode_tags(self, episode_id: int) -> set[str]:
         """Return tag names associated with an episode."""

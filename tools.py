@@ -247,6 +247,7 @@ class FPSTracker:
         self._last_time = None
         self._last_step = None
         self._warmup = self._WARMUP_CALLS if warmup else 0
+        self._skip_next = False
 
     def compute(self, step):
         """Return FPS since the last call, or ``None`` during warmup."""
@@ -254,6 +255,9 @@ class FPSTracker:
         if self._last_step is None:
             self._last_time = now
             self._last_step = step
+            return None
+        if self._skip_next:
+            self._skip_next = False
             return None
         steps = step - self._last_step
         duration = now - self._last_time
@@ -264,10 +268,17 @@ class FPSTracker:
             return None
         return steps / duration if duration > 0 else 0
 
-    def reset(self, step=0):
-        """Reset the timer and step baseline."""
+    def reset(self, step=0, skip_next=False):
+        """Reset the timer and step baseline.
+
+        When *skip_next* is ``True`` the next :meth:`compute` call returns
+        ``None`` without updating state, so the following call spans the
+        full interval from this reset.  Use this when the reset and the
+        next compute fall in the same iteration (e.g. after eval or save).
+        """
         self._last_time = time.time()
         self._last_step = step
+        self._skip_next = skip_next
 
 
 class Logger:

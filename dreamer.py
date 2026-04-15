@@ -1,5 +1,6 @@
 import copy
 import math
+import time
 from collections import OrderedDict
 
 import networks
@@ -14,6 +15,31 @@ from tools import to_f32
 from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
+
+
+class PerfTimer:
+    """Lightweight wall-clock timer for profiling multi-GPU phases.
+
+    Uses ``time.perf_counter()`` instead of CUDA events to avoid
+    cross-device issues when timing phases that span multiple GPUs.
+    Relies on ``torch.cuda.synchronize()`` being called at phase
+    boundaries (which the two-sync dispatch already does).
+    """
+
+    def __init__(self):
+        self._starts = {}
+        self._results = {}
+
+    def start(self, name):
+        self._starts[name] = time.perf_counter()
+
+    def stop(self, name):
+        if name in self._starts:
+            self._results[name] = (time.perf_counter() - self._starts[name]) * 1000
+
+    def elapsed_ms(self):
+        """Return {name: ms} for all completed timings."""
+        return dict(self._results)
 
 
 class _FakeOptimizer:
@@ -744,33 +770,57 @@ class Dreamer(nn.Module):
         """
         if self._compile and not self._compiled:
             _mode = self._compile_mode
-            print(f"Compiling _cal_grad_with_modules with torch.compile(mode={_mode!r})...")
-            self._cal_grad_with_modules = torch.compile(
-                self._cal_grad_with_modules, mode=_mode
-            )
-            # Compile a separate instance PER REPLICA DEVICE so each gets its
-            # own clean Dynamo/Inductor state, avoiding cross-device overhead.
             if self.data_parallel:
+                # Two-sync path: compile Part A and Part B separately.
+                print(f"Compiling _forward_world_model with torch.compile(mode={_mode!r})...")
+                self._forward_world_model = torch.compile(
+                    self._forward_world_model, mode=_mode
+                )
+                print(f"Compiling _forward_actor_critic_and_backward with torch.compile(mode={_mode!r})...")
+                self._forward_actor_critic_and_backward = torch.compile(
+                    self._forward_actor_critic_and_backward, mode=_mode
+                )
+                # Per-replica compiled instances.
                 import types
-                self._cal_grad_per_replica = []
-                _uncompiled = type(self)._cal_grad_with_modules
+                self._forward_wm_per_replica = []
+                self._forward_ac_per_replica = []
+                _uncompiled_wm = type(self)._forward_world_model
+                _uncompiled_ac = type(self)._forward_actor_critic_and_backward
                 for ri, replica in enumerate(self._replicas):
                     dev = replica["device"]
-                    print(f"Compiling _cal_grad for replica {ri} ({dev}) "
+                    print(f"Compiling Part A+B for replica {ri} ({dev}) "
                           f"with mode={_mode!r}...")
-                    compiled_fn = torch.compile(
-                        types.MethodType(_uncompiled, self),
-                        mode=_mode,
+                    self._forward_wm_per_replica.append(
+                        torch.compile(types.MethodType(_uncompiled_wm, self), mode=_mode)
                     )
-                    self._cal_grad_per_replica.append(compiled_fn)
+                    self._forward_ac_per_replica.append(
+                        torch.compile(types.MethodType(_uncompiled_ac, self), mode=_mode)
+                    )
+            else:
+                # Single-GPU path: compile the monolithic function.
+                print(f"Compiling _cal_grad_with_modules with torch.compile(mode={_mode!r})...")
+                self._cal_grad_with_modules = torch.compile(
+                    self._cal_grad_with_modules, mode=_mode
+                )
             self._compiled = True
 
+        _timer = PerfTimer()
+        _t0 = time.perf_counter()
+
+        torch.cuda.nvtx.range_push("sample")
+        _timer.start("sample")
         sample = replay_buffer.sample()
+        _timer.stop("sample")
+        torch.cuda.nvtx.range_pop()
         if sample is None:
             return {}  # skip this update – trajectories too short
         data, index, initial, opp_initial = sample
         torch.compiler.cudagraph_mark_step_begin()
+        torch.cuda.nvtx.range_push("preprocess")
+        _timer.start("preprocess")
         p_data = self.preprocess(data)
+        _timer.stop("preprocess")
+        torch.cuda.nvtx.range_pop()
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
@@ -802,35 +852,75 @@ class Dreamer(nn.Module):
                 all_stoch.append(stoch)
                 all_deter.append(deter)
         else:
-            # --- Multi-GPU: distribute micro-batches across GPUs ---
+            # --- Multi-GPU: two-sync parallel dispatch ---
+            # All GPUs run Part A (world model + imagination) in parallel,
+            # sync to compute return_ema over the full batch, then all GPUs
+            # run Part B (actor-critic + backward) in parallel.
             num_gpus = len(self.train_devices)
-            # Round-robin assignment ensures balance.
             gpu_assignments = [[] for _ in range(num_gpus)]
             for i in range(num_acc):
                 gpu_assignments[i % num_gpus].append(i)
 
-            # == Phase 1: primary's first micro-batch to get return_ema state ==
-            first_idx = gpu_assignments[0][0]
-            s, e = first_idx * mbs, (first_idx + 1) * mbs
-            micro_data = p_data[s:e]
-            micro_initial = (initial[0][s:e], initial[1][s:e])
-            micro_opp = None
-            if opp_initial is not None:
-                micro_opp = (opp_initial[0][s:e], opp_initial[1][s:e])
-            with autocast(device_type=self.train_device.type, dtype=torch.float16):
-                (stoch, deter), mets = self._cal_grad(
-                    micro_data, micro_initial, loss_scale, opp_initial=micro_opp
-                )
-            primary_results = [(first_idx, stoch, deter)]
-            # Grab return_ema state for all subsequent micro-batches.
-            ret_norm_state = (
-                self.return_ema.ema_vals[0].item(),
-                self.return_ema.ema_vals[1].item(),
-            )
+            # Helper dicts for primary modules.
+            _primary_modules = {
+                "encoder": self.encoder, "rssm": self.rssm,
+                "actor": self.actor, "value": self.value,
+                "reward": self.reward, "cont": self.cont,
+                "decoder": getattr(self, "decoder", None),
+                "prj": getattr(self, "prj", None),
+            }
+            _primary_frozen = {
+                "rssm": self._frozen_rssm,
+                "reward": self._frozen_reward,
+                "cont": self._frozen_cont,
+                "actor": self._frozen_actor,
+                "value": self._frozen_value,
+                "slow_value": self._frozen_slow_value,
+            }
+            _primary_opp = {
+                "rssm": self._imag_opp_rssm,
+                "actor": self._imag_opp_actor,
+            }
 
-            # == Phase 2: remaining primary + all replica micro-batches ==
-            # Primary's remaining micro-batches
-            for i in gpu_assignments[0][1:]:
+            # == Pre-stage: async data transfers to all replica GPUs ==
+            torch.cuda.nvtx.range_push("prestage_transfers")
+            _timer.start("prestage")
+            replica_staged = []
+            for gpu_idx, replica in enumerate(self._replicas, start=1):
+                dev = replica["device"]
+                xfer_stream = torch.cuda.Stream(dev)
+                with torch.cuda.stream(xfer_stream):
+                    batches = []
+                    for i in gpu_assignments[gpu_idx]:
+                        s, e = i * mbs, (i + 1) * mbs
+                        micro_opp = None
+                        if opp_initial is not None:
+                            micro_opp = (
+                                opp_initial[0][s:e].to(dev, non_blocking=True),
+                                opp_initial[1][s:e].to(dev, non_blocking=True),
+                            )
+                        batches.append((
+                            i,
+                            p_data[s:e].to(dev, non_blocking=True),
+                            (initial[0][s:e].to(dev, non_blocking=True),
+                             initial[1][s:e].to(dev, non_blocking=True)),
+                            micro_opp,
+                        ))
+                replica_staged.append((gpu_idx, replica, xfer_stream, batches))
+            _timer.stop("prestage")
+            torch.cuda.nvtx.range_pop()
+
+            # == Part A: all GPUs run world model + imagination in parallel ==
+            torch.cuda.nvtx.range_push("part_a")
+            _timer.start("part_a")
+            # Collect (micro_batch_idx, ret, intermediates, losses, metrics)
+            # per GPU for Part B.
+            part_a_results_primary = []
+            part_a_results_replica = []  # (gpu_idx, micro_idx, ret_on_primary, intermediates, losses, metrics)
+
+            # Primary GPU Part A
+            torch.cuda.nvtx.range_push("part_a_primary")
+            for i in gpu_assignments[0]:
                 s, e = i * mbs, (i + 1) * mbs
                 micro_data = p_data[s:e]
                 micro_initial = (initial[0][s:e], initial[1][s:e])
@@ -838,81 +928,145 @@ class Dreamer(nn.Module):
                 if opp_initial is not None:
                     micro_opp = (opp_initial[0][s:e], opp_initial[1][s:e])
                 with autocast(device_type=self.train_device.type, dtype=torch.float16):
-                    (stoch, deter), mets = self._cal_grad_with_modules(
-                        modules={
-                            "encoder": self.encoder, "rssm": self.rssm,
-                            "actor": self.actor, "value": self.value,
-                            "reward": self.reward, "cont": self.cont,
-                            "decoder": getattr(self, "decoder", None),
-                            "prj": getattr(self, "prj", None),
-                        },
-                        frozen={
-                            "rssm": self._frozen_rssm,
-                            "reward": self._frozen_reward,
-                            "cont": self._frozen_cont,
-                            "actor": self._frozen_actor,
-                            "value": self._frozen_value,
-                            "slow_value": self._frozen_slow_value,
-                        },
-                        opp_modules={
-                            "rssm": self._imag_opp_rssm,
-                            "actor": self._imag_opp_actor,
-                        },
-                        scaler=self._scaler,
+                    ret, intermediates, losses, part_mets = self._forward_world_model(
+                        modules=_primary_modules,
+                        frozen=_primary_frozen,
+                        opp_modules=_primary_opp,
                         data=micro_data, initial=micro_initial,
-                        loss_scale=loss_scale, opp_initial=micro_opp,
-                        ret_norm_state=ret_norm_state,
+                        opp_initial=micro_opp,
                     )
-                primary_results.append((i, stoch, deter))
+                part_a_results_primary.append((i, ret, intermediates, losses, part_mets))
+            torch.cuda.nvtx.range_pop()
 
-            # Replica GPUs' micro-batches (concurrent via separate CUDA devices).
-            replica_results = []
-            for gpu_idx, (replica, rep_scaler) in enumerate(
-                zip(self._replicas, self._replica_scalers), start=1
-            ):
+            # Replica GPUs Part A (data already pre-staged)
+            for gpu_idx, replica, xfer_stream, batches in replica_staged:
                 dev = replica["device"]
-                for i in gpu_assignments[gpu_idx]:
-                    s, e = i * mbs, (i + 1) * mbs
-                    micro_data = p_data[s:e]
-                    micro_initial = (initial[0][s:e], initial[1][s:e])
-                    micro_opp = None
-                    if opp_initial is not None:
-                        micro_opp = (opp_initial[0][s:e], opp_initial[1][s:e])
+                ri = gpu_idx - 1
+                torch.cuda.current_stream(dev).wait_stream(xfer_stream)
+                torch.cuda.nvtx.range_push(f"part_a_replica_{ri}")
+                _wm_fn = self._forward_wm_per_replica[ri] if hasattr(self, "_forward_wm_per_replica") else self._forward_world_model
+                for i, micro_data, micro_initial, micro_opp in batches:
                     with autocast(device_type=dev.type, dtype=torch.float16):
-                        (stoch, deter), mets = self._cal_grad_on_replica(
-                            replica, rep_scaler,
-                            micro_data, micro_initial, loss_scale,
-                            ret_norm_state=ret_norm_state,
+                        ret, intermediates, losses, part_mets = _wm_fn(
+                            modules={
+                                "encoder": replica["encoder"],
+                                "rssm": replica["rssm"],
+                                "actor": replica["actor"],
+                                "value": replica["value"],
+                                "reward": replica["reward"],
+                                "cont": replica["cont"],
+                                "decoder": replica.get("decoder"),
+                                "prj": replica.get("prj"),
+                            },
+                            frozen=replica["frozen"],
+                            opp_modules={
+                                "rssm": replica.get("imag_opp_rssm"),
+                                "actor": replica.get("imag_opp_actor"),
+                            },
+                            data=micro_data, initial=micro_initial,
                             opp_initial=micro_opp,
                         )
-                    # Move posteriors back to primary device for buffer update.
-                    replica_results.append((
-                        i,
-                        stoch.to(self.train_device),
-                        deter.to(self.train_device),
-                    ))
+                    part_a_results_replica.append((gpu_idx, i, ret, intermediates, losses, part_mets))
+                torch.cuda.nvtx.range_pop()
+            _timer.stop("part_a")
+            torch.cuda.nvtx.range_pop()  # part_a
 
-            # Synchronize all CUDA devices.
+            # == Sync 1: compute return_ema over full batch ==
+            torch.cuda.nvtx.range_push("sync_ret_ema")
+            _timer.start("sync_ema")
             for dev in self.train_devices:
                 torch.cuda.synchronize(dev)
+            # Gather ret tensors from all GPUs to primary for quantile computation.
+            all_ret_for_ema = []
+            for _, ret, _, _, _ in part_a_results_primary:
+                all_ret_for_ema.append(ret)
+            for _, _, ret, _, _, _ in part_a_results_replica:
+                all_ret_for_ema.append(ret.to(self.train_device))
+            concatenated_ret = torch.cat(all_ret_for_ema)
+            ret_offset, ret_scale = self.return_ema(concatenated_ret)
+            ret_norm_state = (ret_offset.item(), ret_scale.item())
+            _timer.stop("sync_ema")
+            torch.cuda.nvtx.range_pop()
 
-            # NOTE: gradient reduction happens after primary unscale below,
-            # so both primary and replica grads are in the same fp32 space.
+            # == Part B: all GPUs run actor-critic + backward in parallel ==
+            torch.cuda.nvtx.range_push("part_b")
+            _timer.start("part_b")
+            all_results = []
+
+            # Primary GPU Part B
+            torch.cuda.nvtx.range_push("part_b_primary")
+            for i, ret, intermediates, losses, part_mets in part_a_results_primary:
+                with autocast(device_type=self.train_device.type, dtype=torch.float16):
+                    (stoch, deter), mets = self._forward_actor_critic_and_backward(
+                        modules=_primary_modules,
+                        frozen=_primary_frozen,
+                        scaler=self._scaler,
+                        intermediates=intermediates,
+                        ret=ret,
+                        ret_norm_state=ret_norm_state,
+                        loss_scale=loss_scale,
+                        partial_losses=losses,
+                    )
+                mets.update(part_mets)
+                all_results.append((i, stoch, deter))
+            torch.cuda.nvtx.range_pop()
+
+            # Replica GPUs Part B
+            for gpu_idx, mi, ret, intermediates, losses, part_mets in part_a_results_replica:
+                ri = gpu_idx - 1
+                replica = self._replicas[ri]
+                rep_scaler = self._replica_scalers[ri]
+                dev = replica["device"]
+                _ac_fn = self._forward_ac_per_replica[ri] if hasattr(self, "_forward_ac_per_replica") else self._forward_actor_critic_and_backward
+                torch.cuda.nvtx.range_push(f"part_b_replica_{ri}")
+                with autocast(device_type=dev.type, dtype=torch.float16):
+                    (stoch, deter), mets = _ac_fn(
+                        modules={
+                            "encoder": replica["encoder"],
+                            "rssm": replica["rssm"],
+                            "actor": replica["actor"],
+                            "value": replica["value"],
+                            "reward": replica["reward"],
+                            "cont": replica["cont"],
+                            "decoder": replica.get("decoder"),
+                            "prj": replica.get("prj"),
+                        },
+                        frozen=replica["frozen"],
+                        scaler=rep_scaler,
+                        intermediates=intermediates,
+                        ret=ret,
+                        ret_norm_state=ret_norm_state,
+                        loss_scale=loss_scale,
+                        partial_losses=losses,
+                    )
+                mets.update(part_mets)
+                all_results.append((mi, stoch.to(self.train_device), deter.to(self.train_device)))
+                torch.cuda.nvtx.range_pop()
+            _timer.stop("part_b")
+            torch.cuda.nvtx.range_pop()  # part_b
+
+            # == Sync 2: wait for all GPUs ==
+            _timer.start("sync_grad")
+            for dev in self.train_devices:
+                torch.cuda.synchronize(dev)
+            _timer.stop("sync_grad")
 
             # Collect results in original micro-batch order.
-            all_results = sorted(
-                primary_results + replica_results, key=lambda x: x[0]
-            )
+            all_results.sort(key=lambda x: x[0])
             for _, stoch, deter in all_results:
                 all_stoch.append(stoch)
                 all_deter.append(deter)
 
         # --- Optimizer step (runs on primary training GPU) ---
+        torch.cuda.nvtx.range_push("reduce_gradients")
+        _timer.start("reduce_grad")
         self._scaler.unscale_(self._optimizer)  # unscale primary grads
         # Reduce replica gradients AFTER primary unscale so both sides are
         # in the same unscaled fp32 space.  No-op when data_parallel=False.
         # Returns True if any replica had inf — primary scaler won't know.
         _replica_inf = self._reduce_gradients()
+        _timer.stop("reduce_grad")
+        torch.cuda.nvtx.range_pop()
         if _replica_inf:
             # A replica produced inf grads.  Zero primary grads and skip step
             # (mirrors what GradScaler.step does when it detects inf itself).
@@ -928,12 +1082,16 @@ class Dreamer(nn.Module):
                 mets["opt/grad_norm"] = grad_norm
                 mets["opt/grad_rms"] = grad_rms
             self._agc(self._named_params.values())  # clipping
+            torch.cuda.nvtx.range_push("optimizer_step")
+            _timer.start("optimizer")
             self._scaler.step(self._optimizer)  # update params
         # update/scheduler/zero always run — matches single-GPU behaviour
         # where scaler.step() may skip internally but the rest proceeds.
         self._scaler.update()  # adjust scale
         self._scheduler.step()  # increment scheduler
         if not _replica_inf:
+            _timer.stop("optimizer")
+            torch.cuda.nvtx.range_pop()
             self._optimizer.zero_grad(set_to_none=True)  # reset grads
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
@@ -949,12 +1107,24 @@ class Dreamer(nn.Module):
             rep_scaler.update()
 
         # --- Sync weights ---
+        torch.cuda.nvtx.range_push("broadcast_params")
+        _timer.start("broadcast")
         if self.data_parallel:
             self._broadcast_params()       # primary -> replicas
+        _timer.stop("broadcast")
+        torch.cuda.nvtx.range_pop()
         # Signal that new weights are available for inference copies.
         # The main thread calls sync_inference_if_needed() to pull them
         # before the next act() call, avoiding blocking here.
         self._weights_version += 1
+
+        # Total update wall-clock time.
+        _total_ms = (time.perf_counter() - _t0) * 1000
+        # Collect GPU timings (safe after the sync barriers above).
+        _gpu_times = _timer.elapsed_ms()
+        for k, v in _gpu_times.items():
+            mets[f"timing/{k}_ms"] = v
+        mets["timing/total_update_ms"] = _total_ms
 
         # Update latent vectors in replay buffer with concatenated posteriors.
         # When trajectory mirroring is active the batch is doubled (original +
@@ -1274,6 +1444,247 @@ class Dreamer(nn.Module):
         )
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
+        metrics.update(tools.tensorstats(value_replay, "value_replay"))
+        metrics.update(tools.tensorstats(slow_value_replay, "slow_value_replay"))
+
+        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
+        scaler.scale(total_loss * loss_scale).backward()
+
+        metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
+        metrics.update({"opt/loss": total_loss})
+        return (post_stoch, post_deter), metrics
+
+    # ------------------------------------------------------------------
+    # Split versions of _cal_grad_with_modules for two-sync parallelism.
+    # Part A: world model + imagination → produces `ret` tensor.
+    # Part B: actor-critic losses + backward (needs ret_norm_state from sync).
+    # Used only in the data-parallel multi-GPU path.
+    # ------------------------------------------------------------------
+
+    def _forward_world_model(
+        self, modules, frozen, opp_modules,
+        data, initial, opp_initial=None,
+    ):
+        """Part A: world model forward + imagination rollout.
+
+        Runs encoder → RSSM → decoder/aux losses → imagination → lambda returns.
+        Everything up to (but NOT including) return_ema / advantage computation.
+
+        Returns
+        -------
+        ret : Tensor
+            Lambda returns from imagination, shape ``(B*T, imag_horizon-1, 1)``.
+        intermediates : dict
+            All tensors needed by Part B, staying on the same device.
+        partial_losses : dict
+            World model losses (dyn, rep, decoder, rew, con).
+        partial_metrics : dict
+            World model metrics.
+        """
+        encoder = modules["encoder"]
+        _rssm = modules["rssm"]
+        reward = modules["reward"]
+        cont = modules["cont"]
+        decoder = modules.get("decoder")
+        prj = modules.get("prj")
+        frozen_rssm = frozen["rssm"]
+        frozen_actor = frozen["actor"]
+        frozen_reward = frozen["reward"]
+        frozen_cont = frozen["cont"]
+        frozen_value = frozen["value"]
+        frozen_slow_value = frozen["slow_value"]
+        imag_opp_rssm = opp_modules.get("rssm")
+        imag_opp_actor = opp_modules.get("actor")
+        dev = data.device if hasattr(data, "device") else next(encoder.parameters()).device
+
+        losses = {}
+        metrics = {}
+        B, T = data.shape
+
+        # === World model: posterior rollout and KL losses ===
+        embed = encoder(data)
+        if self.opponent_separation:
+            wm_action = torch.cat([data["action"], data["opponent_action"]], dim=-1)
+        else:
+            wm_action = data["action"]
+        post_stoch, post_deter, post_logit = _rssm.observe(embed, wm_action, initial, data["is_first"])
+        _, prior_logit = _rssm.prior(post_deter)
+        dyn_loss, rep_loss = _rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+        losses["dyn"] = torch.mean(dyn_loss)
+        losses["rep"] = torch.mean(rep_loss)
+
+        # === Representation / auxiliary losses ===
+        feat = _rssm.get_feat(post_stoch, post_deter)
+        if self.rep_loss == "dreamer":
+            recon_losses = {
+                key: torch.mean(-dist.log_prob(data[key])) for key, dist in decoder(post_stoch, post_deter).items()
+            }
+            losses.update(recon_losses)
+        elif self.rep_loss == "r2dreamer":
+            x1 = prj(feat[:, :].reshape(B * T, -1))
+            x2 = embed.reshape(B * T, -1).detach()
+            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
+            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
+            c = torch.mm(x1_norm.T, x2_norm) / (B * T)
+            invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+            off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
+            redundancy_loss = c[off_diag_mask].pow(2).sum()
+            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+        elif self.rep_loss == "infonce":
+            x1 = prj(feat[:, :].reshape(B * T, -1))
+            x2 = embed.reshape(B * T, -1).detach()
+            logits = torch.matmul(x1, x2.T)
+            norm_logits = logits - torch.max(logits, 1)[0][:, None]
+            labels = torch.arange(norm_logits.shape[0]).long().to(dev)
+            losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+        else:
+            raise NotImplementedError(f"rep_loss={self.rep_loss!r} not supported in split path")
+
+        losses["rew"] = torch.mean(-reward(feat).log_prob(to_f32(data["reward"])))
+        cont_target = 1.0 - to_f32(data["is_terminal"])
+        losses["con"] = torch.mean(-cont(feat).log_prob(cont_target))
+        metrics["dyn_entropy"] = torch.mean(_rssm.get_dist(prior_logit).entropy())
+        metrics["rep_entropy"] = torch.mean(_rssm.get_dist(post_logit).entropy())
+
+        # === Imagination rollout for actor-critic ===
+        start = (
+            post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
+            post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
+        )
+        opp_start = None
+        if self.opponent_separation and self._imag_opponent == "selfplay":
+            if "opp_stoch" in data:
+                opp_start = (
+                    data["opp_stoch"].reshape(-1, *data["opp_stoch"].shape[2:]).detach(),
+                    data["opp_deter"].reshape(-1, *data["opp_deter"].shape[2:]).detach(),
+                )
+        imag_feat, imag_action = self._imagine_with_modules(
+            start, self.imag_horizon + 1,
+            frozen_rssm=frozen_rssm,
+            frozen_actor=frozen_actor,
+            imag_opp_rssm=imag_opp_rssm,
+            imag_opp_actor=imag_opp_actor,
+            opp_start=opp_start,
+        )
+        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+
+        imag_reward = frozen_reward(imag_feat).mode()
+        imag_cont = frozen_cont(imag_feat).mean
+        imag_value = frozen_value(imag_feat).mode()
+        imag_slow_value = frozen_slow_value(imag_feat).mode()
+        disc = 1 - 1 / self.horizon
+        weight = torch.cumprod(imag_cont * disc, dim=1)
+        last = torch.zeros_like(imag_cont)
+        term = 1 - imag_cont
+        ret = self._lambda_return(
+            last, term, imag_reward, imag_value, imag_value, disc, self.lamb
+        )
+
+        # Pack everything Part B needs.
+        intermediates = {
+            "post_stoch": post_stoch, "post_deter": post_deter,
+            "imag_feat": imag_feat, "imag_action": imag_action,
+            "imag_reward": imag_reward, "imag_value": imag_value,
+            "imag_slow_value": imag_slow_value,
+            "imag_cont": imag_cont, "weight": weight,
+            "data": data, "B": B, "T": T,
+        }
+        return ret, intermediates, losses, metrics
+
+    def _forward_actor_critic_and_backward(
+        self, modules, frozen, scaler,
+        intermediates, ret, ret_norm_state, loss_scale, partial_losses,
+    ):
+        """Part B: actor-critic losses + backward pass.
+
+        Uses ``ret_norm_state`` (from the cross-GPU return_ema sync) to
+        normalize advantages, then computes policy/value/replay-value losses,
+        sums everything, and calls ``backward()``.
+
+        Returns
+        -------
+        posteriors : tuple[Tensor, Tensor]
+            ``(post_stoch, post_deter)`` for buffer update.
+        metrics : dict
+            All training metrics (world model + actor-critic).
+        """
+        _rssm = modules["rssm"]
+        actor = modules["actor"]
+        value = modules["value"]
+        frozen_value = frozen["value"]
+        frozen_slow_value = frozen["slow_value"]
+
+        post_stoch = intermediates["post_stoch"]
+        post_deter = intermediates["post_deter"]
+        imag_feat = intermediates["imag_feat"]
+        imag_action = intermediates["imag_action"]
+        imag_value = intermediates["imag_value"]
+        imag_slow_value = intermediates["imag_slow_value"]
+        weight = intermediates["weight"]
+        data = intermediates["data"]
+        B = intermediates["B"]
+        T = intermediates["T"]
+
+        losses = dict(partial_losses)  # copy so we don't mutate caller's dict
+        metrics = {}
+
+        # === Actor-critic with synced return normalization ===
+        ret_offset, ret_scale = ret_norm_state
+        adv = (ret - imag_value[:, :-1]) / ret_scale
+
+        policy = actor(imag_feat)
+        logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
+        entropy = policy.entropy()[:, :-1].unsqueeze(-1)
+        losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+
+        imag_value_dist = value(imag_feat)
+        tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+        losses["value"] = torch.mean(
+            weight[:, :-1].detach()
+            * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
+                :, :-1
+            ].unsqueeze(-1)
+        )
+
+        # Metrics
+        ret_normed = (ret - ret_offset) / ret_scale
+        metrics["ret"] = torch.mean(ret_normed)
+        metrics["ret_005"] = ret_norm_state[0]
+        metrics["ret_095"] = ret_norm_state[1]
+        metrics["adv"] = torch.mean(adv)
+        metrics["adv_std"] = torch.std(adv)
+        metrics["con"] = torch.mean(intermediates["imag_cont"])
+        metrics["rew"] = torch.mean(intermediates["imag_reward"])
+        metrics["val"] = torch.mean(imag_value)
+        metrics["tar"] = torch.mean(ret)
+        metrics["slowval"] = torch.mean(imag_slow_value)
+        metrics["weight"] = torch.mean(weight)
+        metrics["action_entropy"] = torch.mean(entropy)
+        metrics.update(tools.tensorstats(imag_action, "action"))
+
+        # === Replay-based value learning (keep gradients through world model) ===
+        last, term, reward_data = (
+            to_f32(data["is_last"]),
+            to_f32(data["is_terminal"]),
+            to_f32(data["reward"]),
+        )
+        feat = _rssm.get_feat(post_stoch, post_deter)
+        boot = ret[:, 0].reshape(B, T, 1)
+        value_replay = frozen_value(feat).mode()
+        slow_value_replay = frozen_slow_value(feat).mode()
+        disc = 1 - 1 / self.horizon
+        weight_replay = 1.0 - last
+        ret_replay = self._lambda_return(last, term, reward_data, value_replay, boot, disc, self.lamb)
+        ret_padded = torch.cat([ret_replay, 0 * ret_replay[:, -1:]], 1)
+
+        value_dist = value(feat)
+        losses["repval"] = torch.mean(
+            weight_replay[:, :-1]
+            * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value_replay.detach()))[:, :-1].unsqueeze(
+                -1
+            )
+        )
+        metrics.update(tools.tensorstats(ret_replay, "ret_replay"))
         metrics.update(tools.tensorstats(value_replay, "value_replay"))
         metrics.update(tools.tensorstats(slow_value_replay, "slow_value_replay"))
 

@@ -1,4 +1,5 @@
 import threading
+import time
 import warnings
 from collections import defaultdict
 
@@ -18,6 +19,10 @@ class Buffer:
         self._original_batch_size = None
         self.num_eps = 0
         self._lock = threading.Lock()
+        # Lock wait timing accumulators (read/reset by trainer for logging).
+        self.lock_wait_sample_ns = 0
+        self.lock_wait_add_ns = 0
+        self.lock_contention_count = 0
         if sampler is None:
             sampler = SliceSampler(
                 num_slices=self.batch_size, end_key=None, traj_key="episode", truncated_key=None, strict_length=True
@@ -32,11 +37,22 @@ class Buffer:
     def add_transition(self, data):
         # This is batched data and lifted for storage.
         # (B, ...) -> (B, 1, ...)
-        with self._lock:
+        _t = time.perf_counter_ns()
+        _blocked = not self._lock.acquire(blocking=False)
+        if _blocked:
+            self.lock_contention_count += 1
+            self._lock.acquire()
+        self.lock_wait_add_ns += time.perf_counter_ns() - _t
+        try:
             self._buffer.extend(data.unsqueeze(1))
+        finally:
+            self._lock.release()
 
     def sample(self):
-        with self._lock:
+        _t = time.perf_counter_ns()
+        self._lock.acquire()
+        self.lock_wait_sample_ns += time.perf_counter_ns() - _t
+        try:
             try:
                 sample_td, info = self._buffer.sample(return_info=True)
             except RuntimeError as e:
@@ -44,6 +60,8 @@ class Buffer:
                     warnings.warn(f"Replay buffer sample skipped: {e}")
                     return None
                 raise
+        finally:
+            self._lock.release()
         # The sampler returns a flattened batch of length B*(T+1).
         # (B*(T+1), ...) -> (B, T+1, ...)
         sample_td = sample_td.view(-1, self.batch_length + 1)
@@ -314,7 +332,8 @@ class PrioritizedBuffer(Buffer):
             if storage.shape is None:
                 return {}, 0
             raw_td = storage._storage  # underlying TensorDict
-            episode_tensor = raw_td["episode"]
+            valid_len = len(storage)
+            episode_tensor = raw_td["episode"][:valid_len]
             current_ids: set[int] = set(episode_tensor.reshape(-1).unique().tolist())
             current_ids.discard(0)  # uninitialized slots before buffer fills
 

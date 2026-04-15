@@ -8,9 +8,9 @@ defaults:
 logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S} # if logdir is set to a non empty directory the training will continue from the latest checkpoint in that directory
 seed: 0
 deterministic_run: False
-device: 'cuda:0'
-init_checkpoint: null  # Path to checkpoint for weight-only init (pretrain -> finetune)
-load_world_model_only: false  # When true + init_checkpoint set: load only world model weights, skip actor/critic
+device: "cuda:0"
+init_checkpoint: null # Path to checkpoint for weight-only init (pretrain -> finetune)
+load_world_model_only: false # When true + init_checkpoint set: load only world model weights, skip actor/critic
 
 hydra:
   run:
@@ -24,7 +24,7 @@ buffer:
   batch_length: ${batch_length}
   max_size: 5e5
   device: ${device}
-  storage_device: 'cuda:0'
+  storage_device: "cuda:0"
   prioritized:
     enable: false
     debug_metrics: false
@@ -42,3 +42,9 @@ trainer:
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}
   save_checkpoint_every: 0 # Save checkpoint every N steps (0 = only save at the end)
+  profiling:
+    torch_profiler: true # Periodic chrome traces (Perfetto)
+    torch_profiler_wait: 2000 # Updates between profiling windows
+    torch_profiler_active: 5 # Updates per profiling window
+    cprofile: true # Periodic cProfile dumps
+    cprofile_every: 10000 # Steps between cProfile dumps

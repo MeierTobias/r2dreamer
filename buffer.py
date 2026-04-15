@@ -332,7 +332,7 @@ class PrioritizedBuffer(Buffer):
             if storage.shape is None:
                 return {}, 0
             raw_td = storage._storage  # underlying TensorDict
-            valid_len = len(storage)
+            valid_len = storage.shape[0]
             episode_tensor = raw_td["episode"][:valid_len]
             current_ids: set[int] = set(episode_tensor.reshape(-1).unique().tolist())
             current_ids.discard(0)  # uninitialized slots before buffer fills

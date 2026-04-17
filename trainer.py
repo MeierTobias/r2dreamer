@@ -513,9 +513,9 @@ class OnlineTrainer:
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
-                    if self.video_pred_log and not _training_in_flight:
+                    if self.video_pred_log:
                         # video_pred reads inference copies on sim device.
-                        # Only run when training is idle to avoid blocking.
+                        # Pause training to ensure consistent weights during sync.
                         if _training_started:
                             self._pause_training()
                         agent.sync_inference_if_needed()

@@ -513,6 +513,12 @@ class OnlineTrainer:
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
+                    # Compute FPS before video_pred so its wall-clock time
+                    # is excluded from the next interval's measurement (via
+                    # the reset below) rather than skipping this one.
+                    _train_fps = self._fps.compute(self._step)
+                    if _train_fps is not None:
+                        self.logger.scalar("fps/train", _train_fps)
                     if self.video_pred_log:
                         # video_pred reads inference copies on sim device.
                         # Pause training to ensure consistent weights during sync.
@@ -531,9 +537,6 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
-                    _train_fps = self._fps.compute(self._step)
-                    if _train_fps is not None:
-                        self.logger.scalar("fps/train", _train_fps)
                     # Log main-loop timing averages (Level 1).
                     if _main_timing_count > 0:
                         for k, v in _main_timing.items():

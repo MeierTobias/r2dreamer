@@ -143,9 +143,10 @@ class OnlineTrainer:
     def _training_loop(self, agent, stop_event):
         """Background thread: runs agent.update() on cuda:1..N.
 
-        All compiled functions were already traced on the main thread
-        (via the warmup update call).  This thread only executes the
-        cached compiled code — no Dynamo retracing occurs.
+        Only started when ``agent.multi_gpu`` is True (sim and training on
+        disjoint devices).  All compiled functions were already traced on the
+        main thread (via the warmup update call).  This thread only executes
+        the cached compiled code — no Dynamo retracing occurs.
         """
         # --- Profiling setup ---
         _profiler_cfg = getattr(self, "_profiler_cfg", {})
@@ -259,16 +260,22 @@ class OnlineTrainer:
 
     def _pause_training(self):
         """Pause the training thread and wait until it has stopped."""
+        if not self._async_training:
+            return
         self._train_resume.clear()
         self._train_paused.wait()
 
     def _resume_training(self):
         """Resume the training thread."""
+        if not self._async_training:
+            return
         self._train_paused.clear()
         self._train_resume.set()
 
     def _check_train_exception(self):
         """Re-raise any exception from the training thread."""
+        if not self._async_training:
+            return
         exc = self._train_exception
         if exc is not None:
             self._train_exception = None
@@ -281,7 +288,14 @@ class OnlineTrainer:
         requires main-thread).  A background thread runs agent.update on
         cuda:1..N.  All torch.compile compilation is done on the main thread
         before the training thread starts.
+
+        When ``agent.multi_gpu`` is False (sim and training share a device),
+        async training is disabled and ``agent.update()`` runs inline on the
+        main thread.  Concurrent CUDA-graph replay (from compile mode
+        ``reduce-overhead``) and RNG use from ``act()`` on the same device
+        otherwise trigger "Offset increment outside graph capture" errors.
         """
+        self._async_training = bool(getattr(agent, "multi_gpu", False))
         stepper = self.train_stepper
         video_cache = []
         if self._step == 0:
@@ -331,7 +345,7 @@ class OnlineTrainer:
         try:
             while self._step < self.steps:
                 # --- Collect training results (non-blocking) ---
-                if _training_in_flight:
+                if self._async_training and _training_in_flight:
                     try:
                         _num, _metrics = self._train_result_queue.get_nowait()
                         train_metrics = _metrics
@@ -346,7 +360,7 @@ class OnlineTrainer:
                 if self._should_eval(self._step) and self.eval_episode_num > 0:
                     # Wait for all in-flight training to finish so metrics
                     # and weights are fully up to date before eval.
-                    if _training_in_flight:
+                    if self._async_training and _training_in_flight:
                         _num, _metrics = self._train_result_queue.get()
                         train_metrics = _metrics
                         update_count += _num
@@ -385,7 +399,7 @@ class OnlineTrainer:
 
                 # --- Periodic checkpoint saving ---
                 if self._save_fn is not None and self._should_save is not None and self._should_save(self._step):
-                    if _training_in_flight:
+                    if self._async_training and _training_in_flight:
                         _num, _metrics = self._train_result_queue.get()
                         train_metrics = _metrics
                         update_count += _num
@@ -473,34 +487,50 @@ class OnlineTrainer:
                         for _ in range(_warmup_count):
                             train_metrics = agent.update(self.replay_buffer)
                         update_count += _warmup_count
-                        # =====================================================
-                        # Phase 3: Start training thread
-                        # =====================================================
-                        train_thread = threading.Thread(
-                            target=self._training_loop,
-                            args=(agent, stop_event),
-                            daemon=True,
-                            name="training",
-                        )
-                        train_thread.start()
-                        _training_started = True
-                        print("Training thread started.")
-                        if self._should_pretrain() and self.pretrain > 0:
-                            print(f"Pretrain: dispatching {self.pretrain} updates to training thread...")
-                            self._train_request_queue.put(self.pretrain)
-                            _training_in_flight = True
+                        if self._async_training:
+                            # =================================================
+                            # Phase 3: Start training thread (multi-GPU)
+                            # =================================================
+                            train_thread = threading.Thread(
+                                target=self._training_loop,
+                                args=(agent, stop_event),
+                                daemon=True,
+                                name="training",
+                            )
+                            train_thread.start()
+                            _training_started = True
+                            print("Training thread started.")
+                            if self._should_pretrain() and self.pretrain > 0:
+                                print(f"Pretrain: dispatching {self.pretrain} updates to training thread...")
+                                self._train_request_queue.put(self.pretrain)
+                                _training_in_flight = True
+                        else:
+                            # Single-GPU: run updates inline on the main thread.
+                            _training_started = True
+                            print("Training runs inline on main thread (sim and train share a device).")
+                            if self._should_pretrain() and self.pretrain > 0:
+                                print(f"Pretrain: running {self.pretrain} updates inline...")
+                                for _ in range(self.pretrain):
+                                    train_metrics = agent.update(self.replay_buffer)
+                                update_count += self.pretrain
                     else:
-                        # Wait for previous batch to finish (same as the
-                        # original synchronous code where updates block).
-                        if _training_in_flight:
-                            _num, _metrics = self._train_result_queue.get()
-                            train_metrics = _metrics
-                            update_count += _num
-                            _training_in_flight = False
-                        update_num = self._updates_needed(self._step)
-                        if update_num > 0:
-                            self._train_request_queue.put(update_num)
-                            _training_in_flight = True
+                        if self._async_training:
+                            # Wait for previous batch to finish (same as the
+                            # original synchronous code where updates block).
+                            if _training_in_flight:
+                                _num, _metrics = self._train_result_queue.get()
+                                train_metrics = _metrics
+                                update_count += _num
+                                _training_in_flight = False
+                            update_num = self._updates_needed(self._step)
+                            if update_num > 0:
+                                self._train_request_queue.put(update_num)
+                                _training_in_flight = True
+                        else:
+                            update_num = self._updates_needed(self._step)
+                            for _ in range(update_num):
+                                train_metrics = agent.update(self.replay_buffer)
+                            update_count += update_num
 
                 # --- Log training metrics ---
                 if self._should_log(self._step) and train_metrics:
@@ -564,7 +594,7 @@ class OnlineTrainer:
                     ).start()
 
         finally:
-            if train_thread is not None:
+            if self._async_training and train_thread is not None:
                 if _training_in_flight:
                     try:
                         self._train_result_queue.get(timeout=30)

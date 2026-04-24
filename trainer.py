@@ -563,7 +563,7 @@ class OnlineTrainer:
                                 self.logger.video("open_loop", tools.to_np(vp))
                         if _training_started:
                             self._resume_training()
-                            self._fps.reset(self._step, skip_next=True)
+                            self._fps.reset(self._step)
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))

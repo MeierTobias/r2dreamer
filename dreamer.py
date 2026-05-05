@@ -1389,6 +1389,11 @@ class Dreamer(nn.Module):
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+        # SkyDreamer smoothness regularization on policy mean only (keeps entropy bonus on σ untouched).
+        mu = policy.mean
+        mu_diff = mu[:, 1:] - mu[:, :-1]
+        smoothness = (mu_diff ** 2).sum(dim=-1, keepdim=True)
+        losses["smoothness"] = torch.mean(weight[:, :-1].detach() * smoothness)
 
         imag_value_dist = value(imag_feat)
         # (B*T, T_imag, 1)
@@ -1417,6 +1422,7 @@ class Dreamer(nn.Module):
         metrics["slowval"] = torch.mean(imag_slow_value)
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
+        metrics["action_mean_delta_l2"] = torch.mean(smoothness)
         metrics.update(tools.tensorstats(imag_action, "action"))
 
         # === Replay-based value learning (keep gradients through world model) ===
@@ -1636,6 +1642,11 @@ class Dreamer(nn.Module):
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+        # SkyDreamer smoothness regularization on policy mean only (keeps entropy bonus on σ untouched).
+        mu = policy.mean
+        mu_diff = mu[:, 1:] - mu[:, :-1]
+        smoothness = (mu_diff ** 2).sum(dim=-1, keepdim=True)
+        losses["smoothness"] = torch.mean(weight[:, :-1].detach() * smoothness)
 
         imag_value_dist = value(imag_feat)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
@@ -1660,6 +1671,7 @@ class Dreamer(nn.Module):
         metrics["slowval"] = torch.mean(imag_slow_value)
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
+        metrics["action_mean_delta_l2"] = torch.mean(smoothness)
         metrics.update(tools.tensorstats(imag_action, "action"))
 
         # === Replay-based value learning (keep gradients through world model) ===

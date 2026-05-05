@@ -35,6 +35,7 @@ loss_scales:
   policy: 1.0
   value: 1.0
   repval: 0.3
+  smoothness: 0.0
   swav: 1.0
   temp: 1.0
   norm: 1.0

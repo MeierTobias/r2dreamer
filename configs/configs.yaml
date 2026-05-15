@@ -18,6 +18,7 @@ hydra:
 
 batch_size: 16
 batch_length: 64
+micro_batch_size: ${batch_size}
 
 buffer:
   batch_size: ${batch_size}

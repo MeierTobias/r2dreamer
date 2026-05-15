@@ -8,7 +8,6 @@ compile_mode: "reduce-overhead" # torch.compile mode for training: "reduce-overh
 inference_compile_mode: null    # torch.compile mode for inference copies (act/video_pred). null = same as compile_mode, "none" = no compilation
 log_grads: False
 device: ${device}
-micro_batch_size: ${batch_size}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 opponent_separation: false
 imag_opponent: 'random' # "random" | "zero" | "selfplay"
